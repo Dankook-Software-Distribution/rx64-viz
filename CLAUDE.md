@@ -1,20 +1,35 @@
 # CLAUDE.md
 
 Web visualizer for two x86-64 ports of xv6: `rx64-x86-style` and `rx64-riscv-style`
-(sibling repos, expected at `../rx64-x86-style` and `../rx64-riscv-style`). It boots each
+(separate git repos, kept in `os/rx64-x86-style` and `os/rx64-riscv-style`). It boots each
 kernel in QEMU, attaches gdb, and draws live kernel data structures in the browser.
 Audience: OS students. The kernels are never modified; everything is read through gdb.
 
 ## Commands
 
 ```
-(cd ../rx64-riscv-style && make) && (cd ../rx64-x86-style && make)   # kernel/kernel + fs.img
-./mvnw spring-boot:run          # http://127.0.0.1:8080, boots both kernels
-./mvnw test                     # unit tests (MI parser only; no VM)
+make up        # Docker: build image (kernels + jar) and run in background, http://127.0.0.1:8080
+make down      # stop the container
+make logs      # follow container logs
+make local     # build os/ kernels, then ./mvnw spring-boot:run against them
+make kernels   # build kernel/kernel + fs.img in os/rx64-*-style
+make test      # unit tests (MI parser only; no VM)
 ```
 
-Requirements: JDK 25 (not just a JRE), `qemu-system-x86_64`, gdb >= 12 with Python.
-Kernel paths and `-smp` are in `src/main/resources/application.properties`.
+`make up` and `make local` both use port 8080; run `make down` before `make local`.
+
+Requirements: Docker only for `make up`. For `make local`: JDK 25 (not just a JRE),
+`qemu-system-x86_64`, gdb >= 12 with Python, gcc/binutils, perl.
+Kernel paths and `-smp` are in `src/main/resources/application.properties` (defaults point at
+`../rx64-*-style`); `make local` and the Docker image override the paths on the command line
+to use `os/rx64-*-style`.
+
+### Docker
+
+- `Dockerfile` has three stages: Ubuntu 24.04 builds both kernels from `os/`, JDK 25 builds the
+  jar, JRE 25 + `qemu-system-x86` + `gdb` runs it with `--server.address=0.0.0.0`.
+- `compose.yaml` publishes only on `127.0.0.1:8080` and sets `init: true` to reap QEMU/gdb.
+- Kernel or `xv6viz.py` changes need `make up` again (rebuilds the image).
 
 ## Layout
 
