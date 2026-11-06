@@ -20,8 +20,9 @@ import tools.jackson.databind.json.JsonMapper;
 
 /**
  * 브라우저와 주고받는 WebSocket. 모든 메시지에 "vm"(커널 이름)이 붙는다.
- * 보내는 것: status, console, snapshot, journey, syscalls, error
- * 받는 것: input, pause, resume, restart, autoRefresh, focus, journeyStart, journeyNext, journeyCancel
+ * 보내는 것: status, console, snapshot, structs, record, debug, breakpoints, error
+ * 받는 것: input, pause, resume, restart, autoRefresh, focus, recordStart, recordStop, recordClear,
+ *         debugNext, debugStep, debugFinish, debugFrame, debugThread, breakpoint
  */
 @Component
 public class Hub extends TextWebSocketHandler {
@@ -40,11 +41,18 @@ public class Hub extends TextWebSocketHandler {
     @Override
     public void afterConnectionEstablished(WebSocketSession raw) throws IOException {
         WebSocketSession s = new ConcurrentWebSocketSessionDecorator(raw, 5000, 8 * 1024 * 1024);
-        sessions.add(s);
         s.sendMessage(new TextMessage(json.writeValueAsString(
                 java.util.Map.of("type", "kernels", "data", vms.all().stream().map(Vm::id).toList()))));
-        for (Vm vm : vms.all()) {
-            for (String m : vm.greeting()) s.sendMessage(new TextMessage(m));
+        // 리스너에 먼저 넣고 현재 상태를 보낸다. 콘솔 리플레이와 이후 출력의 순서는 Vm.greet()이 맞춘다.
+        sessions.add(s);
+        for (Vm vm : vms.all()) vm.greet(m -> send(s, m));
+    }
+
+    private static void send(WebSocketSession s, String msg) {
+        try {
+            s.sendMessage(new TextMessage(msg));
+        } catch (Exception e) {
+            log.debug("전송 실패", e);
         }
     }
 
@@ -55,7 +63,13 @@ public class Hub extends TextWebSocketHandler {
 
     @Override
     protected void handleTextMessage(WebSocketSession session, TextMessage message) {
-        JsonNode m = json.readTree(message.getPayload());
+        JsonNode m;
+        try {
+            m = json.readTree(message.getPayload());
+        } catch (RuntimeException e) {
+            log.debug("JSON이 아닌 메시지 무시: {}", message.getPayload());
+            return;
+        }
         Vm vm;
         try {
             vm = vms.get(m.path("vm").asString(""));
@@ -70,21 +84,22 @@ public class Hub extends TextWebSocketHandler {
             case "restart" -> vm.start();
             case "autoRefresh" -> vm.setAutoRefresh(m.path("on").asBoolean(true));
             case "focus" -> vm.focus(m.path("pid").asInt());
-            case "journeyStart" -> vm.journeyStart(m.path("name").asString(""), m.path("syscall").asString(""));
-            case "journeyNext" -> vm.journeyNext();
-            case "journeyCancel" -> vm.journeyCancel();
+            case "recordStart" -> vm.recordStart();
+            case "recordClear" -> vm.recordClear();
+            case "debugNext" -> vm.debugStep("next");
+            case "debugStep" -> vm.debugStep("step");
+            case "debugFinish" -> vm.debugStep("finish");
+            case "debugNexti" -> vm.debugStep("nexti");
+            case "debugStepi" -> vm.debugStep("stepi");
+            case "debugFrame" -> vm.debugFrame(m.path("level").asInt(0));
+            case "debugThread" -> vm.debugThread(m.path("cpu").asInt(0));
+            case "breakpoint" -> vm.breakpoint(m.path("file").asString(""), m.path("line").asInt(0), m.path("on").asBoolean(true));
+            case "recordStop" -> vm.recordStop();
             default -> log.debug("알 수 없는 메시지: {}", m);
         }
     }
 
     private void broadcast(String msg) {
-        TextMessage tm = new TextMessage(msg);
-        for (WebSocketSession s : sessions) {
-            try {
-                s.sendMessage(tm);
-            } catch (Exception e) {
-                log.debug("전송 실패", e);
-            }
-        }
+        for (WebSocketSession s : sessions) send(s, msg);
     }
 }

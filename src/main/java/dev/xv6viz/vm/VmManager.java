@@ -22,7 +22,7 @@ public class VmManager {
 
     public Vm get(String id) {
         Vm vm = vms.get(id);
-        if (vm == null) throw new IllegalArgumentException("없는 커널: " + id);
+        if (vm == null) throw new IllegalArgumentException("no such kernel: " + id);
         return vm;
     }
 

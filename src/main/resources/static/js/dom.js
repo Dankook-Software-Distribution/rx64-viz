@@ -46,3 +46,27 @@ export function big(hex) {
   return BigInt(hex);
 }
 
+
+// 다시 그린 el 안에서 직전 그림과 비교해, 값이 바뀐 [data-k]에는 chg, 새로 생긴 [data-n]에는 new를 붙인다.
+// scope가 다르면(다른 프로세스, 다른 커널) 비교하지 않는다.
+export function markChanges(el, scope) {
+  let old = el._marks?.scope === scope ? el._marks : null;
+  if (old && !old.vals.size && !old.ids.size) old = null;
+  const vals = new Map(), ids = new Set();
+  for (const e of el.querySelectorAll("[data-k]")) {
+    const k = e.dataset.k, v = e.textContent;
+    vals.set(k, v);
+    if (old?.vals.has(k) && old.vals.get(k) !== v) e.classList.add("chg");
+  }
+  for (const e of el.querySelectorAll("[data-n]")) {
+    ids.add(e.dataset.n);
+    if (old && !old.ids.has(e.dataset.n)) e.classList.add("new");
+  }
+  el._marks = { scope, vals, ids };
+}
+
+// el이 box 안에서 margin보다 가장자리에 붙거나 벗어났으면 box만 스크롤해 높이의 at 위치에 둔다
+export function reveal(box, el, margin, at) {
+  const b = box.getBoundingClientRect(), r = el.getBoundingClientRect();
+  if (r.top < b.top + margin || r.bottom > b.bottom - margin) box.scrollTop += r.top - b.top - at * (b.height - r.height);
+}

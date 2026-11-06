@@ -16,7 +16,7 @@ import json
 M64 = (1 << 64) - 1
 PGSIZE = 4096
 PTE_ADDR = 0x000FFFFFFFFFF000
-PHYSTOP = 128 * 1024 * 1024
+PHYSTOP = 128 * 1024 * 1024  # init()에서 $xv6_phystop (QEMU -m, Vm.java)으로 바꾼다
 STATES = ["UNUSED", "USED", "SLEEPING", "RUNNABLE", "RUNNING", "ZOMBIE"]
 FTYPES = ["FD_NONE", "FD_PIPE", "FD_INODE", "FD_DEVICE"]
 ITYPES = {0: "-", 1: "T_DIR", 2: "T_FILE", 3: "T_DEVICE"}
@@ -56,8 +56,14 @@ class Arch:
     flag_bits = [(0, "P"), (1, "W"), (2, "U"), (3, "PWT"), (4, "PCD"),
                  (5, "A"), (6, "D"), (7, "PS"), (63, "NX")]
 
+    phys_on = True  # 우리 코드가 메모리를 읽는 방식 (riscv-style만 바뀐다)
+
     def setup(self):
         pass
+
+    def phys(self, on):
+        """riscv-style: gdb 자체 기능(호출 스택, 변수, step)은 가상 주소로 읽어야 해서 끄고,
+        우리 코드는 물리 주소로 읽으니 켠다. x86-style은 늘 가상 주소라 할 일이 없다."""
 
     def rdk(self, va, n):
         """커널 가상 주소에서 읽기"""
@@ -153,6 +159,14 @@ class RiscvStyle(Arch):
 
     def setup(self):
         gdb.execute("maint packet Qqemu.PhyMemMode:1", to_string=True)
+        self.phys_on = True
+
+    def phys(self, on):
+        if on == self.phys_on:
+            return
+        gdb.execute("maint packet Qqemu.PhyMemMode:%d" % (1 if on else 0), to_string=True)
+        gdb.execute("maint flush register-cache", to_string=True)  # 다른 방식으로 읽어 둔 값 버리기
+        self.phys_on = on
 
     @property
     def kpt_pa(self):  # main() 시점에는 아직 0이라 매번 읽는다
@@ -244,9 +258,12 @@ _INIT = False
 
 def init():
     global A, _INIT, NPROC, NOFILE, NBUF, PROC_BASE, PROC_SIZE, ETEXT, END
-    global TF_SIZE, TF_FIELDS, TF_OFF, SYSCALLS
+    global TF_SIZE, TF_FIELDS, TF_OFF, SYSCALLS, PHYSTOP
     if _INIT:
         return
+    mem = gdb.convenience_variable("xv6_phystop")
+    if mem is not None:
+        PHYSTOP = int(mem)
     A = RiscvStyle() if has_symbol("trampoline") else X86Style()
     A.setup()
     NPROC = int(ev("sizeof(proc)/sizeof(proc[0])"))
@@ -271,7 +288,19 @@ def init():
     _INIT = True
 
 
+SYM_CACHE = {}
+
+
 def sym(addr):
+    """주소의 심볼 이름+오프셋. 커널 이미지는 바뀌지 않으니 주소별로 기억한다."""
+    if addr not in SYM_CACHE:
+        if len(SYM_CACHE) > 50000:
+            SYM_CACHE.clear()
+        SYM_CACHE[addr] = sym_lookup(addr)
+    return SYM_CACHE[addr]
+
+
+def sym_lookup(addr):
     if isinstance(A, RiscvStyle):
         addr = A.tramp_to_sym(addr)
     try:
@@ -319,7 +348,7 @@ def proc_by_pid(pid):
     for i in live_procs():
         if int(ev("proc[%d].pid" % i)) == pid:
             return i
-    raise gdb.GdbError("pid %d 없음" % pid)
+    raise gdb.GdbError("no pid %d" % pid)
 
 
 def read_proc(i):
@@ -341,7 +370,8 @@ def read_proc(i):
         "pagetablePa": hx(A.pt_pa(u(p["pagetable"]))),
         "kstack": hx(u(p["kstack"])),
         "trapframe": hx(u(p["trapframe"])),
-        "context": {"rip": hx(rip), "ripSym": sym(rip) if rip else None, "rsp": hx(rsp)},
+        "context": {"rip": hx(rip), "ripSym": sym(rip) if rip else None, "rsp": hx(rsp),
+                    "rbp": hx(u(p["context"]["rbp"]))},
         "ofile": [hx(u(p["ofile"][k])) if u(p["ofile"][k]) else None for k in range(NOFILE)],
         "cwd": hx(u(p["cwd"])) if u(p["cwd"]) else None,
     }
@@ -351,10 +381,16 @@ def read_cpus():
     sel = gdb.selected_thread()
     out = []
     try:
+        regs = []
         for t in sorted(inf().threads(), key=lambda t: t.num):
             t.switch()
             f = gdb.newest_frame()
-            r = {n: u(f.read_register(n)) for n in ("rip", "rsp", "cs", "cr3", "eflags")}
+            regs.append((t, {n: u(f.read_register(n)) for n in ("rip", "rsp", "rbp", "cs", "cr3", "eflags", "cr0")}))
+        # 메모리는 페이징이 켜진 CPU에서 읽는다. 막 부팅한 AP는 아직 페이징이 없어
+        # x86-style의 상위 절반 주소를 읽을 수 없다.
+        paging = [t for t, r in regs if r["cr0"] & (1 << 31)]
+        (sel if sel in paging or not paging else paging[0]).switch()
+        for t, r in regs:
             idx = A.cpu_index(t.num)
             c = ev("cpus[%d]" % idx)
             pp = u(c["proc"])
@@ -363,7 +399,7 @@ def read_cpus():
                 "cpu": idx, "thread": t.num,
                 "addr": hx(u(ev("(long)&cpus[%d]" % idx))),
                 "mode": "user" if user else "kernel",
-                "rip": hx(r["rip"]), "rsp": hx(r["rsp"]), "cr3": hx(r["cr3"]),
+                "rip": hx(r["rip"]), "rsp": hx(r["rsp"]), "rbp": hx(r["rbp"]), "cr3": hx(r["cr3"]),
                 "fn": None if user else sym(r["rip"]),
                 "src": None if user else src_of(r["rip"]),
                 "intr": bool(r["eflags"] & 0x200),
@@ -527,6 +563,10 @@ def walk(root_pa, va):
                        "present": bool(e & 1)})
         if not e & 1:
             return {"va": hx(va), "root": hx(root_pa), "levels": levels, "pa": None}
+        if shift != 12 and e & 0x80:  # 큰 페이지: 이 항목이 마지막 단계
+            size = 1 << shift
+            pa = (e & PTE_ADDR & ~(size - 1)) | (va & (size - 1))
+            return {"va": hx(va), "root": hx(root_pa), "levels": levels, "pa": hx(pa)}
         pa = e & PTE_ADDR
     return {"va": hx(va), "root": hx(root_pa), "levels": levels, "pa": hx(pa | (va & 0xFFF))}
 
@@ -564,7 +604,7 @@ def bcache_blocks():
     return out
 
 
-def files_of(i):
+def files_of(i, bcache=True):
     p = ev("proc[%d]" % i)
     files, inodes, pipes = {}, {}, {}
     fds = []
@@ -592,7 +632,7 @@ def files_of(i):
     cwd = u(p["cwd"])
     if cwd and hx(cwd) not in inodes:
         inodes[hx(cwd)] = read_inode(cwd)
-    cached = bcache_blocks()
+    cached = bcache_blocks() if bcache else {}
     for ino in inodes.values():
         ino["cached"] = [dict(blockno=b, **cached[b]) for b in ino["addrs"] if b in cached]
     return {"fds": fds, "files": list(files.values()), "inodes": list(inodes.values()),
@@ -656,11 +696,19 @@ def physmem():
         if ks is not None:
             setk(ks, 6, pid, force=True)
 
-    t = A.table(A.kpt_pa)
-    setk(A.kpt_pa, 9, force=True)
-    for idx in range(512):
-        if t[idx] & 1:
-            setk(t[idx] & PTE_ADDR, 9, force=True)
+    # kernel_pagetable의 모든 단계 테이블 페이지 (x86-style은 유저 PML4 256~511번과 공유)
+    seen = set()
+    stack = [(A.kpt_pa, 0)] if A.kpt_pa else []
+    while stack:
+        pa, lvl = stack.pop()
+        if pa in seen:
+            continue
+        seen.add(pa)
+        setk(pa, 9, force=True)
+        if lvl < 3:
+            for e in A.table(pa):
+                if e & 1 and not e & 0x80:
+                    stack.append((e & PTE_ADDR, lvl + 1))
 
     for k in range(int(ev("sizeof(ftable.file)/sizeof(ftable.file[0])"))):
         f = ev("ftable.file[%d]" % k)
@@ -699,42 +747,29 @@ def snapshot(pid=None):
     return out
 
 
-# ---------------------------------------------------------------- 트랩 추적
+# ---------------------------------------------------------------- 트랩 단계
 #
-# 시스템 콜 하나를 단계마다 브레이크포인트로 멈춘다. 다른 CPU의 시스템 콜이나
-# 같은 스택에 중첩된 인터럽트에는 멈추지 않도록 rsp와 cr3를 비교한다.
-
-class StepBp(gdb.Breakpoint):
-    def __init__(self, spec, step):
-        super().__init__(spec, gdb.BP_BREAKPOINT, internal=True)
-        self.step = step
-
-    def stop(self):
-        try:
-            return J.check(self.step)
-        except Exception as e:
-            gdb.write("xv6viz stop error: %s\n" % e, gdb.STDERR)
-            return False
-
+# 시스템 콜 하나가 지나가는 단계: (이름, 브레이크포인트 위치, 조건).
+# 조건은 정확한 rsp(riscv-style은 cr3도)로, 다른 CPU의 시스템 콜이나 같은 스택에
+# 겹친 인터럽트를 거른다. j에는 그 프로세스의 base, top(kstack), tf, upt(유저 페이지 테이블).
 
 def find_insn(start, mnemonic):
     for ins in inf().architecture().disassemble(start, count=60):
         if ins["asm"].startswith(mnemonic):
             return ins["addr"]
-    raise gdb.GdbError("%s 없음" % mnemonic)
+    raise gdb.GdbError("no %s" % mnemonic)
 
 
 def x86_steps():
     iretq = find_insn(u(ev("(long)&trapret")), "iretq")
     return [
-        ("vector64", "*vector64", None),
+        ("vector64", "*vector64", lambda j, r: r["rsp"] == j.top - 40),
         ("alltraps", "*alltraps", lambda j, r: r["rsp"] == j.top - 56),
         ("trap", "*trap", lambda j, r: r["rsp"] == j.tf - 8),
-        ("syscall", "*syscall", lambda j, r: j.base <= r["rsp"] < j.tf),
+        ("syscall", None, lambda j, r: j.base <= r["rsp"] < j.tf),
         ("handler", None, lambda j, r: j.base <= r["rsp"] < j.tf),
         ("trapret", "*trapret", lambda j, r: r["rsp"] == j.tf),
         ("iretq", "*0x%x" % iretq, lambda j, r: r["rsp"] == j.top - 40),
-        ("user", None, None),
     ]
 
 
@@ -743,201 +778,521 @@ def riscv_steps():
     tv = lambda s: T + u(ev("(long)&%s" % s)) - A.tramp_sym
     iretq = T + find_insn(u(ev("(long)&userret")), "iretq") - A.tramp_sym
     return [
-        ("uvec64", "*0x%x" % tv("uvec64"), None),
+        ("uvec64", "*0x%x" % tv("uvec64"), lambda j, r: r["cr3"] == j.upt and r["rsp"] == TF + 168),
         ("uservec", "*0x%x" % tv("uservec"), lambda j, r: r["rsp"] == TF + 152 and r["cr3"] == j.upt),
         ("usertrap", "*usertrap", lambda j, r: r["rsp"] == j.top - 8),
-        ("syscall", "*syscall", lambda j, r: j.base <= r["rsp"] < j.top),
+        ("syscall", None, lambda j, r: j.base <= r["rsp"] < j.top),
         ("handler", None, lambda j, r: j.base <= r["rsp"] < j.top),
         ("prepare_return", "*prepare_return", lambda j, r: j.base <= r["rsp"] < j.top),
         ("userret", "*0x%x" % tv("userret"), lambda j, r: j.base <= r["rsp"] <= j.top),
         ("iretq", "*0x%x" % iretq, lambda j, r: r["rsp"] == TF + 168 and r["cr3"] == j.upt),
-        ("user", None, None),
     ]
 
 
-REGS = ["rip", "rsp", "rax", "rdi", "rsi", "rdx", "cs", "cr3", "eflags"]
+REGS = ["rip", "rsp", "rbp", "rax", "rdi", "rsi", "rdx", "cs", "cr3", "eflags"]
 
 
-class Journey:
-    def __init__(self):
-        self.bps = {}
-        self.reset()
-
-    def reset(self):
-        self.active = False
-        self.steps = []
-        self.expect = None
-        self.hit = None
-        self.pid = self.slot = self.name = None
-        self.base = self.top = self.tf = self.upt = None
-        self.num = None
-        self.retval = None
-        self.filter_name = self.filter_sys = None
+class Trap:
+    """한 프로세스가 지금 지나가는 시스템 콜 하나의 단계 기록"""
+    def __init__(self, slot, base, tf, upt):
+        self.slot, self.base, self.top, self.tf, self.upt = slot, base, base + PGSIZE, tf, upt
+        self.k = 0          # 다음에 기다리는 단계 번호
+        self.stages = []
         self.prev = {}
-        self.done = False
 
-    def clear_bps(self):
-        for b in self.bps.values():
+
+def stage_view(j, step):
+    """지금 멈춘 CPU에서 본 단계 하나: 레지스터, 스택 영역, 소스, 그때의 페이지 테이블"""
+    f = gdb.selected_frame()
+    r = {n: u(f.read_register(n)) for n in REGS}
+    user = (r["cs"] & 3) == 3
+    rsp = r["rsp"]
+    ksp, tsp = j.top, None
+    if not user and j.base <= rsp <= j.top:
+        ksp = rsp
+    if isinstance(A, RiscvStyle) and not user and A.TRAPFRAME <= rsp < A.TRAPFRAME + PGSIZE:
+        tsp = j.tf + (rsp - A.TRAPFRAME)
+    frames = frames_for(j.slot, ksp, tsp, j.prev)
+    j.prev = {fr["name"]: {int(s["addr"], 16): (int(s["value"], 16), s["live"]) for s in fr["slots"]}
+              for fr in frames}
+    pt = "user" if r["cr3"] == j.upt else ("kernel" if r["cr3"] == A.kpt_pa else hx(r["cr3"]))
+    return {"step": step, "regs": {k: hx(v) for k, v in r.items()}, "user": user, "pagetable": pt,
+            "cpu": A.cpu_index(gdb.selected_thread().num),
+            "fn": None if user else sym(r["rip"]), "src": None if user else src_of(r["rip"]),
+            "frames": frames}
+
+
+# ---------------------------------------------------------------- 명령 기록
+#
+# syscall() 입구와 ret에 멈추지 않는 브레이크포인트를 걸어, 시스템 콜마다
+# pid, 이름, 인자, 반환값을 남긴다. 인자는 시그니처에 따라 풀어 쓴다.
+#   i 정수  s 문자열  b 쓸 버퍼(길이는 셋째 인자)  B 읽은 버퍼(반환값만큼)  v argv  o open 모드  p 포인터
+
+SIG = {"fork": "", "exit": "i", "wait": "p", "pipe": "p", "read": "iBi", "write": "ibi", "close": "i",
+       "kill": "i", "exec": "sv", "open": "so", "mknod": "sii", "unlink": "s", "fstat": "ip", "link": "ss",
+       "mkdir": "s", "chdir": "s", "dup": "i", "getpid": "", "sbrk": "i", "sleep": "i", "pause": "i",
+       "uptime": ""}
+OPEN_FLAGS = [(0x001, "O_WRONLY"), (0x002, "O_RDWR"), (0x200, "O_CREATE"), (0x400, "O_TRUNC")]
+REC_MAX = 3000
+STAGED_MAX = 400   # 단계와 직후 상태까지 남기는 시스템 콜 수
+BUF_MAX = 32
+
+
+def s32(v):
+    v &= 0xFFFFFFFF
+    return v - (1 << 32) if v >> 31 else v
+
+
+def s64(v):
+    return v - (1 << 64) if v >> 63 else v
+
+
+def q(b):
+    return json.dumps(b.decode("latin-1"))
+
+
+class RecBp(gdb.Breakpoint):
+    def __init__(self, spec, fn):
+        super().__init__(spec, gdb.BP_BREAKPOINT, internal=True)
+        self.fn = fn
+
+    def stop(self):
+        if not A.phys_on:  # Debug step 중(riscv-style)에는 우리 방식으로 읽을 수 없어 쉰다
+            return False
+        try:
+            self.fn()
+        except Exception as e:
+            gdb.write("xv6viz record error: %s\n" % e, gdb.STDERR)
+        return False
+
+
+class Recorder:
+    def __init__(self):
+        self.bps = []
+        self.active = False
+        self.events = []
+        self.pending = {}
+        self.details = {}
+        self.order = []
+
+    def setup(self):
+        off = lambda t, f: int(ev("(long)&((%s *)0)->%s" % (t, f)))
+        self.off = {f: off("struct proc", f) for f in ("pid", "name", "trapframe", "pagetable", "kstack")}
+        self.cpu_base = u(ev("(long)&cpus[0]"))
+        self.cpu_size = int(ev("sizeof(struct cpu)"))
+        self.cpu_proc = off("struct cpu", "proc")
+        self.tidx = {t.num: A.cpu_index(t.num) for t in inf().threads()}
+        self.src = {n: src_of(sc["addr"]) for n, sc in SYSCALLS.items()}
+        steps = x86_steps() if isinstance(A, X86Style) else riscv_steps()
+        self.order = [n for n, _, _ in steps]
+        self.cond = {n: c for n, _, c in steps}
+        self.spec = {n: sp for n, sp, _ in steps if sp}
+
+    def start(self):
+        self.stop()
+        self.setup()
+        self.events, self.pending, self.seq = [], {}, 0
+        self.details, self.traps, self.nstaged = {}, {}, 0
+        self.active, self.done = True, False
+        # 이미 시스템 콜 안에서 자고 있는 프로세스(셸의 read 등)는 입구를 놓쳤으니
+        # trapframe에 남아 있는 번호와 인자로 미리 채운다
+        for i in live_procs():
+            if STATES[int(ev("proc[%d].state" % i))] == "SLEEPING":
+                self.enter(self.info(PROC_BASE + i * PROC_SIZE), early=True)
+        self.bps.append(RecBp("*syscall", self.enter))
+        blk = func_block(u(ev("(long)&syscall")))
+        for ins in inf().architecture().disassemble(blk.start, blk.end - 1):
+            if ins["asm"].startswith("ret"):
+                self.bps.append(RecBp("*0x%x" % ins["addr"], self.leave))
+        for step, spec in self.spec.items():
+            self.bps.append(RecBp(spec, lambda s=step: self.stage(s)))
+        # sys_exit 입구에는 걸지 않는다. 걸면 exit가 유저로 돌아가 반복되다가 페이지 폴트로
+        # 죽는다(두 버전 모두 재현). 돌아오지 않는 함수 입구의 브레이크포인트를 gdb가
+        # 넘어가는 과정에서 생기는 것으로 보인다. exit의 단계는 syscall까지만 남는다.
+        for addr in sorted({sc["addr"] for sc in SYSCALLS.values() if sc["name"] != "exit"}):
+            self.bps.append(RecBp("*0x%x" % addr, lambda: self.stage("handler")))
+        return {"active": True}
+
+    def stop(self):
+        for b in self.bps:
             try:
                 b.delete()
             except Exception:
                 pass
-        self.bps = {}
-
-    def order(self):
-        return [s[0] for s in self.steps]
-
-    def start(self, name, sysname):
-        self.clear_bps()
-        self.reset()
-        self.active = True
-        self.filter_name = None if name in ("", "-") else name
-        self.filter_sys = None if sysname in ("", "-") else sysname
-        self.steps = x86_steps() if isinstance(A, X86Style) else riscv_steps()
-        for sname, spec, _ in self.steps:
-            if spec:
-                self.bps[sname] = StepBp(spec, sname)
-        self.expect = self.steps[0][0]
-        self.sync_enabled()
-        return self.state()
-
-    def sync_enabled(self):
-        for k, b in self.bps.items():
-            b.enabled = (k == self.expect)
-
-    def cancel(self):
-        self.clear_bps()
-        self.reset()
+        self.bps = []
+        self.active = False
         return {"active": False}
 
-    def regs(self):
+    def cur_p(self):
+        i = self.tidx.get(gdb.selected_thread().num)
+        return None if i is None else A.rd64k(self.cpu_base + i * self.cpu_size + self.cpu_proc)
+
+    def regs2(self):
         f = gdb.selected_frame()
-        return {r: u(f.read_register(r)) for r in REGS}
+        return {"rsp": u(f.read_register("rsp")), "cr3": u(f.read_register("cr3"))}
 
-    def check(self, step):
-        if not self.active or step != self.expect:
-            return False
-        r = self.regs()
-        if step == self.steps[0][0]:
-            return self.first(r)
-        cond = {s[0]: s[2] for s in self.steps}[step]
-        if cond(self, r):
-            self.hit = step
-            return True
-        return False
+    # 트랩 단계 브레이크포인트. 첫 단계에서 그 프로세스의 Trap을 만들고, 그 뒤로는
+    # 기다리던 단계이고 조건이 맞을 때만 찍는다.
+    def stage(self, step):
+        p = self.cur_p()
+        if not p:
+            return
+        if step == self.order[0]:
+            if self.nstaged >= STAGED_MAX:
+                return
+            j = Trap(proc_index_of(p), A.rd64k(p + self.off["kstack"]), A.rd64k(p + self.off["trapframe"]),
+                     A.pt_pa(A.rd64k(p + self.off["pagetable"])))
+            if not self.cond[step](j, self.regs2()):
+                return
+            j.stages.append(stage_view(j, step))
+            j.k = 1
+            self.traps[p] = j
+            self.nstaged += 1
+            return
+        j = self.traps.get(p)
+        if not j or j.k >= len(self.order) or self.order[j.k] != step:
+            return
+        if not self.cond[step](j, self.regs2()):
+            return
+        j.stages.append(stage_view(j, step))
+        j.k += 1
+        if j.k >= len(self.order):
+            del self.traps[p]
 
-    def first(self, r):
-        for i in live_procs():
-            p = ev("proc[%d]" % i)
-            base = u(p["kstack"])
-            if isinstance(A, X86Style):
-                ok = r["rsp"] == base + PGSIZE - 40
-            else:
-                ok = r["cr3"] == A.pt_pa(u(p["pagetable"])) and r["rsp"] == A.TRAPFRAME + 168
-            if not ok:
-                continue
-            name = cstr(p["name"])
-            sc = SYSCALLS.get(r["rax"])
-            if self.filter_name and name != self.filter_name:
-                return False
-            if self.filter_sys and (not sc or sc["name"] != self.filter_sys):
-                return False
-            self.slot, self.pid, self.name = i, int(p["pid"]), name
-            self.base, self.top = base, base + PGSIZE
-            self.tf = u(p["trapframe"])
-            self.upt = A.pt_pa(u(p["pagetable"]))
-            self.num = r["rax"]
-            self.hit = self.steps[0][0]
-            return True
-        return False
-
-    def advance(self):
-        if not self.active:
-            return {"action": "none"}
-        cur = self.hit
-        self.hit = None
-        if cur is None:
-            return {"action": "continue"}
-        if cur == "user" or self.done:
-            self.cancel()
-            return {"action": "finish"}
-        order = self.order()
-        nxt = order[order.index(cur) + 1]
-        if cur == "syscall":
-            sc = SYSCALLS.get(self.num)
-            if "handler" in self.bps:
-                self.bps.pop("handler").delete()
-            if sc:
-                self.bps["handler"] = StepBp("*0x%x" % sc["addr"], "handler")
-            else:
-                nxt = order[order.index("handler") + 1]
-        self.expect = nxt
-        self.sync_enabled()
-        if nxt == "user":
-            for b in self.bps.values():
-                b.enabled = False
-            return {"action": "stepi"}
-        return {"action": "continue"}
-
-    def after_stepi(self):
-        if self.active and self.expect == "user" and self.regs()["cs"] & 3 == 3:
-            self.hit = "user"
-            self.done = True
-        return self.state()
-
-    def state(self):
-        if not self.active:
-            return {"active": False}
-        out = {"active": True, "arch": A.name, "steps": self.order(),
-               "filter": {"name": self.filter_name, "syscall": self.filter_sys},
-               "pid": self.pid, "name": self.name}
-        if self.hit is None:
-            out.update({"phase": "waiting", "expect": self.expect})
-            return out
-        r = self.regs()
-        user = (r["cs"] & 3) == 3
-        rsp = r["rsp"]
-        ksp, tsp = self.top, None
-        if not user and self.base <= rsp <= self.top:
-            ksp = rsp
-        if isinstance(A, RiscvStyle) and not user and A.TRAPFRAME <= rsp < A.TRAPFRAME + PGSIZE:
-            tsp = self.tf + (rsp - A.TRAPFRAME)
-        if isinstance(A, X86Style) and user:
-            ksp = self.top
-        frames = frames_for(self.slot, ksp, tsp, self.prev)
-        self.prev = {fr["name"]: {int(s["addr"], 16): (int(s["value"], 16), s["live"]) for s in fr["slots"]}
-                     for fr in frames}
-        order = self.order()
-        idx = order.index(self.hit)
-        after_handler = idx > order.index("handler")
-        tfv = {f["name"]: f["value"] for f in tf_fields(self.tf)}
-        if after_handler:
-            v = int(tfv["rax"], 16)
-            self.retval = v - (1 << 64) if v >> 63 else v
-        early = idx < order.index("syscall") and self.hit not in ("trap", "usertrap")
-        args = [hx(r["rdi"]), hx(r["rsi"]), hx(r["rdx"])] if early else [tfv["rdi"], tfv["rsi"], tfv["rdx"]]
-        sc = SYSCALLS.get(self.num)
-        pt = "user" if r["cr3"] == self.upt else ("kernel" if r["cr3"] == A.kpt_pa else hx(r["cr3"]))
-        out.update({
-            "phase": "stopped", "step": self.hit, "index": idx,
-            "procState": STATES[int(ev("proc[%d].state" % self.slot))],
-            "cpu": A.cpu_index(gdb.selected_thread().num),
-            "syscall": {"num": self.num, "name": sc["name"] if sc else None,
-                        "handler": sc["handler"] if sc else None, "args": args},
-            "retval": self.retval if after_handler else None,
-            "regs": {k: hx(v) for k, v in r.items()}, "user": user, "pagetable": pt,
-            "fn": None if user else sym(r["rip"]),
-            "src": None if user else src_of(r["rip"]),
-            "frames": frames,
-            "final": self.done or (self.hit == "handler" and bool(sc) and sc["name"] == "exit"),
-        })
+    # 시스템 콜 직후(또는 exit 직전) 그 프로세스: proc, 파일 테이블, 페이지 테이블 요약
+    def after(self, p):
+        slot = proc_index_of(p)
+        root = A.pt_pa(A.rd64k(p + self.off["pagetable"]))
+        out = {"proc": read_proc(slot), "files": files_of(slot, bcache=False), "pt": None}
+        if root:
+            l4 = A.table(root)
+            out["pt"] = {"root": hx(root), "pages": len(user_pages(root)),
+                         "pml4": [k for k in range(512) if l4[k] & 1]}
         return out
 
+    def detail_of(self, i):
+        d = self.details.get(i)
+        if d is None:
+            raise gdb.GdbError("no trace entry %d" % i)
+        return {"i": i, "steps": self.order, "stages": d["trap"].stages if d["trap"] else [], "after": d["after"]}
 
-J = Journey()
+    # 지금 이 CPU의 myproc()
+    def cur(self):
+        return self.info(self.cur_p())
+
+    def info(self, p):
+        if not p:
+            return None
+        pid = int.from_bytes(A.rdk(p + self.off["pid"], 4), "little", signed=True)
+        name = A.rdk(p + self.off["name"], 16).split(b"\0")[0].decode("latin-1")
+        tfb = A.rdk(A.rd64k(p + self.off["trapframe"]), TF_SIZE)
+        reg = lambda n: int.from_bytes(tfb[TF_OFF[n]:TF_OFF[n] + 8], "little")
+        return p, pid, name, reg, A.pt_pa(A.rd64k(p + self.off["pagetable"]))
+
+    # 유저 주소 읽기: 그 프로세스의 페이지 테이블을 따라간다 (두 버전 공통)
+    def uread(self, pt, va, n):
+        out = b""
+        while n > 0:
+            pa = A.walk_pa(pt, va)
+            if pa is None:
+                break
+            k = min(n, PGSIZE - (va & 0xFFF))
+            out += A.rdpa(pa, k)
+            va += k
+            n -= k
+        return out
+
+    def ustr(self, pt, va, n=64):
+        return self.uread(pt, va, n).split(b"\0")[0]
+
+    def decode(self, sname, raw, pt, e):
+        sig = SIG.get(sname)
+        if sig is None:
+            return [hx(x) for x in raw]
+        out = []
+        for k, v in zip(sig, raw):
+            if k == "i":
+                out.append(str(s32(v)))
+            elif k == "s":
+                out.append(q(self.ustr(pt, v)))
+            elif k == "b":
+                n = max(0, s32(raw[2]))
+                b = self.uread(pt, v, min(n, BUF_MAX))
+                e["buf"], e["more"] = b.decode("latin-1"), n > BUF_MAX
+                out.append(q(b) + ("…" if n > BUF_MAX else ""))
+            elif k == "B":
+                out.append(hx(v))
+            elif k == "v":
+                av = []
+                for j in range(8):
+                    a = int.from_bytes(self.uread(pt, v + 8 * j, 8), "little")
+                    if not a:
+                        break
+                    av.append(self.ustr(pt, a).decode("latin-1"))
+                out.append(json.dumps(av))
+            elif k == "o":
+                m = s32(v)
+                names = [n for bit, n in OPEN_FLAGS if m & bit] or ["O_RDONLY"]
+                out.append("|".join(names))
+            else:
+                out.append(hx(v))
+        return out
+
+    def push(self, e):
+        e["i"] = self.seq
+        self.seq += 1
+        j, after = e.pop("_trap", None), e.pop("_after", None)
+        if j or after:
+            self.details[e["i"]] = {"trap": j, "after": after}
+        e["detail"] = bool(j or after)
+        self.events.append(e)
+        if len(self.events) >= REC_MAX:
+            self.done = True
+
+    def enter(self, c=None, early=False):
+        if not early:
+            c = self.cur()
+        if not c:
+            return
+        p, pid, name, reg, pt = c
+        num = reg("rax")
+        sc = SYSCALLS.get(num)
+        sname = sc["name"] if sc else "#%d" % num
+        raw = [reg("rdi"), reg("rsi"), reg("rdx")]
+        e = {"pid": pid, "name": name, "sys": sname, "ret": None, "src": self.src.get(num),
+             "handler": sc["handler"] if sc else None}
+        e["args"] = self.decode(sname, raw, pt, e)
+        if early:
+            e["early"] = True  # 기록을 시작하기 전에 들어간 시스템 콜
+        else:
+            j = self.traps.get(p)
+            if j and j.k < len(self.order) and self.order[j.k] == "syscall" and self.cond["syscall"](j, self.regs2()):
+                j.stages.append(stage_view(j, "syscall"))
+                j.k += 1
+                e["_trap"] = j
+        if sname == "exit":
+            if e.get("_trap"):
+                e["_after"] = self.after(p)
+            self.push(e)
+            return
+        self.pending[p] = (e, raw, pt)
+
+    def leave(self):
+        c = self.cur()
+        if not c:
+            return
+        p, pid, name, reg, pt = c
+        x = self.pending.pop(p, None)
+        if not x:
+            return
+        e, raw, ept = x
+        e["ret"] = s64(reg("rax"))
+        if e["sys"] == "read" and e["ret"] > 0:
+            b = self.uread(ept, raw[1], min(e["ret"], BUF_MAX))
+            e["buf"], e["more"] = b.decode("latin-1"), e["ret"] > BUF_MAX
+            e["args"][1] = q(b) + ("…" if e["more"] else "")
+        if e["sys"] == "exec" and name != e["name"]:
+            e["exec"] = name
+        if e.get("_trap"):
+            e["_after"] = self.after(p)
+        self.push(e)
+
+    def clear(self):
+        self.events, self.details = [], {}
+        self.nstaged = 0  # 단계까지 남기는 한도도 다시 센다
+        return {"active": self.active}
+
+    def poll(self, since):
+        # 끌 때까지 남긴다. REC_MAX가 차면 done
+        return {"active": self.active, "done": self.done, "events": self.events[since:],
+                "pending": [{k: v for k, v in e.items() if not k.startswith("_")} for e, _, _ in self.pending.values()]}
 
 
-# ---------------------------------------------------------------- MI 명령
+R = Recorder()
+
+
+# ---------------------------------------------------------------- Debug
+#
+# 커널을 실제로 멈추고 한 줄씩. 호출 스택과 변수는 gdb의 프레임으로 읽는다(riscv-style은
+# 그동안 물리 주소 모드를 끈다). Step은 Java가 -exec-next/-exec-step/-exec-finish로 한다.
+
+def fmt(v):
+    """변수 값 한 줄"""
+    try:
+        t = v.type.strip_typedefs()
+        if t.code == gdb.TYPE_CODE_STRUCT:
+            parts = []
+            for f in t.fields()[:6]:
+                try:
+                    parts.append("%s = %s" % (f.name, fmt(v[f.name]) if v[f.name].type.strip_typedefs().code != gdb.TYPE_CODE_STRUCT else "{…}"))
+                except gdb.error:
+                    parts.append("%s = ?" % f.name)
+            return "{" + ", ".join(parts) + (", …" if len(t.fields()) > 6 else "") + "}"
+        if t.code == gdb.TYPE_CODE_INT and t.sizeof >= 4 and not str(t).startswith("char"):
+            n = int(v)
+            if -1024 < n < 1024 or n < 0:
+                return str(n)
+            return "0x%x" % n if n >> 32 else "%d (0x%x)" % (n, n)
+        out = str(v)
+    except (gdb.error, gdb.MemoryError, RuntimeError) as e:
+        return "<%s>" % e
+    return out if len(out) <= 160 else out[:160] + "…"
+
+
+def func_block(pc):
+    """pc가 들어 있는 함수의 gdb 블록 (디버그 정보가 없으면 None)"""
+    try:
+        b = gdb.block_for_pc(pc)
+    except RuntimeError:
+        return None
+    while b is not None and b.function is None:
+        b = b.superblock
+    return b
+
+
+def frame_symbols(f):
+    """프레임에서 보이는 인자와 지역 변수 (안쪽 블록부터, 같은 이름은 한 번)"""
+    seen = set()
+    try:
+        b = f.block()
+    except RuntimeError:
+        return
+    while b is not None:
+        for sy in b:
+            if (sy.is_argument or sy.is_variable) and sy.name not in seen:
+                seen.add(sy.name)
+                yield sy
+        if b.function is not None:
+            break
+        b = b.superblock
+
+
+def frame_vars(f):
+    out = []
+    for sy in frame_symbols(f):
+        try:
+            val = fmt(sy.value(f))
+        except (gdb.error, gdb.MemoryError, RuntimeError) as e:
+            val = "<%s>" % e
+        out.append({"name": sy.name, "arg": sy.is_argument, "value": val})
+    return sorted(out, key=lambda x: not x["arg"])
+
+
+def mem_vars(f):
+    """스택(메모리)에 있는 이 프레임의 변수: 이름과 주소. 레지스터에만 있는 변수는 뺀다."""
+    out = []
+    for sy in frame_symbols(f):
+        try:
+            v = sy.value(f)
+            if not v.is_optimized_out and v.address is not None:
+                out.append({"name": sy.name, "addr": hx(u(v.address)), "size": v.type.sizeof})
+        except (gdb.error, gdb.MemoryError, RuntimeError):
+            pass
+    return out
+
+
+ASM_MAX = 320
+
+
+def disasm(pc, older=False):
+    """pc가 있는 함수의 명령어. C 줄이 바뀌는 곳마다 {file, line} 머리를 넣는다(줄 내용은 브라우저가 읽는다).
+    older: 호출한 쪽 프레임이면 pc는 복귀 주소이므로 그 앞(call)을 현재 명령어로 본다.
+    riscv-style 트램펄린은 실행 주소와 심볼 주소가 달라 delta만큼 옮겨서 찾는다."""
+    key = pc - 1 if older else pc
+    s_pc = A.tramp_to_sym(key) if isinstance(A, RiscvStyle) else key
+    delta = key - s_pc
+    b = func_block(s_pc)
+    name, lo, hi = (b.function.name, b.start, b.end) if b is not None else (None, None, None)
+    if lo is None:
+        # 어셈블리(.S) 함수: 블록이 없으니 심볼 시작부터 다음 심볼 전까지
+        nm = sym(key)
+        if nm is None:
+            return None
+        name, _, off = nm.partition("+")
+        lo = s_pc - (int(off) if off else 0)
+        hi = None
+    arch = gdb.selected_frame().architecture()
+    if hi is not None:
+        insns = arch.disassemble(lo + delta, hi + delta - 1, ASM_MAX * 2)
+    else:
+        insns = []
+        for x in arch.disassemble(lo + delta, count=ASM_MAX):
+            if insns and (sym(x["addr"]) or "").partition("+")[0] != name:
+                break
+            insns.append(x)
+    cur = next((i for i, x in enumerate(insns) if x["addr"] <= key < x["addr"] + x["length"]), 0)
+    a0 = max(0, cur - ASM_MAX // 2)
+    rows, last = [], None
+    for x in insns[a0:a0 + ASM_MAX]:
+        at = src_of(x["addr"])
+        if at and at != last:
+            rows.append(at)
+        last = at or last
+        rows.append({"addr": hx(x["addr"]), "off": x["addr"] - delta - lo, "asm": x["asm"]})
+    return {"fn": name, "pc": hx(insns[cur]["addr"]) if insns else hx(pc), "rows": rows}
+
+
+def debug_state(level=0):
+    """지금 고른 CPU(스레드)가 멈춘 곳: 호출 스택, level번 프레임의 변수, 그 CPU의 프로세스"""
+    level = int(level)
+    th = gdb.selected_thread()
+    frames, chosen = [], None
+    A.phys(False)
+    try:
+        f = gdb.newest_frame()
+        i = 0
+        while f is not None and i < 24:
+            pc = u(f.pc())
+            sal = f.find_sal()
+            name = f.name() or sym(pc)
+            # 커널 코드가 아닌 곳(trapframe의 값, 스택 바닥)을 프레임으로 읽은 것은 끊는다
+            if i and name is None:
+                break
+            try:
+                sp = hx(u(f.read_register("rsp")))
+            except gdb.error:
+                sp = None
+            frames.append({"level": i, "fn": name, "pc": hx(pc), "sp": sp, "vars": mem_vars(f),
+                           "file": sal.symtab.filename if sal.symtab else None, "line": sal.line or None})
+            if i == level:
+                chosen = f
+            try:
+                f = f.older()
+            except gdb.error:
+                break
+            i += 1
+        vars_ = frame_vars(chosen) if chosen is not None else []
+        try:
+            asm = disasm(u(chosen.pc()), older=level > 0) if chosen is not None else None
+        except (gdb.error, gdb.MemoryError, RuntimeError):
+            asm = None
+        rip = u(gdb.newest_frame().read_register("rip"))
+        cs = u(gdb.newest_frame().read_register("cs"))
+    finally:
+        A.phys(True)
+    cpu = A.cpu_index(th.num)
+    p = u(ev("(long)cpus[%d].proc" % cpu))
+    pid = name = None
+    if p:
+        pr = ev("*(struct proc *)0x%x" % p)
+        pid, name = int(pr["pid"]), cstr(pr["name"])
+    return {"cpu": cpu, "thread": th.num, "pid": pid, "name": name, "user": (cs & 3) == 3, "rip": hx(rip),
+            "frames": frames, "level": min(level, max(0, len(frames) - 1)), "locals": vars_, "asm": asm}
+
+
+def debug_thread(cpu):
+    for t in inf().threads():
+        if A.cpu_index(t.num) == int(cpu):
+            t.switch()
+            return debug_state(0)
+    raise gdb.GdbError("no cpu %s" % cpu)
+
+
+def step_prep():
+    """Step 직전: riscv-style은 물리 주소 모드를 끈다 (다음 -xv6-* 명령이 다시 켠다)"""
+    A.phys(False)
+    return {"ok": True}
+
 
 class Mi(gdb.MICommand):
     def __init__(self, name, fn):
@@ -945,15 +1300,43 @@ class Mi(gdb.MICommand):
         self.fn = fn
 
     def invoke(self, argv):
+        # 실패는 MI ^error로 돌려준다. Java 쪽 GdbMi.call()이 예외로 바꾼다.
         try:
             init()
+            A.phys(True)  # step-prep은 바로 다시 끈다
             res = self.fn(*argv)
+        except gdb.GdbError:
+            raise
         except Exception as e:
-            res = {"error": "%s: %s" % (type(e).__name__, e)}
+            raise gdb.GdbError("%s: %s" % (type(e).__name__, e))
         return {"json": json.dumps(res)}
 
 
-def _walk(pid, va):
+STRUCTS = ["proc", "cpu", "context", "trapframe", "file", "inode", "pipe", "buf"]
+
+
+def structs():
+    """구조체가 정의된 소스 위치. 화면에서 필드 위에 마우스를 올리면 선언 줄을 보여 준다."""
+    out = {}
+    for name in STRUCTS:
+        try:
+            txt = gdb.execute("info types ^%s$" % name, to_string=True)
+        except gdb.error:
+            continue
+        f = None
+        for ln in txt.splitlines():
+            if ln.startswith("File ") and ln.endswith(":"):
+                f = ln[5:-1]
+            elif f and ln.strip().endswith("struct %s;" % name):
+                out[name] = {"file": f, "line": int(ln.split(":")[0])}
+                break
+    return out
+
+
+def _walk(pid, va, which="user"):
+    """which: user = 그 프로세스의 페이지 테이블, kernel = kernel_pagetable"""
+    if which == "kernel":
+        return walk(A.kpt_pa, int(va, 0))
     i = proc_by_pid(int(pid))
     return walk(A.pt_pa(u(ev("proc[%d].pagetable" % i))), int(va, 0))
 
@@ -962,11 +1345,12 @@ Mi("-xv6-init", lambda: {"arch": A.name})
 Mi("-xv6-snapshot", lambda pid=None: snapshot(pid))
 Mi("-xv6-walk", _walk)
 Mi("-xv6-physmem", physmem)
-Mi("-xv6-syscalls", lambda: sorted(({"num": v["num"], "name": v["name"]} for v in SYSCALLS.values()),
-                                   key=lambda x: x["num"]))
-Mi("-xv6-journey-start", lambda name="-", sysname="-": J.start(name, sysname))
-Mi("-xv6-journey-advance", lambda: J.advance())
-Mi("-xv6-journey-after-stepi", lambda: J.after_stepi())
-Mi("-xv6-journey-state", lambda: J.state())
-Mi("-xv6-journey-cancel", lambda: J.cancel())
-Mi("-xv6-journey-hit", lambda: {"hit": J.hit})
+Mi("-xv6-structs", structs)
+Mi("-xv6-record-start", lambda: R.start())
+Mi("-xv6-record-poll", lambda since="0": R.poll(int(since)))
+Mi("-xv6-record-stop", lambda: R.stop())
+Mi("-xv6-record-clear", lambda: R.clear())
+Mi("-xv6-debug-state", lambda level="0": debug_state(level))
+Mi("-xv6-debug-thread", debug_thread)
+Mi("-xv6-step-prep", step_prep)
+Mi("-xv6-record-detail", lambda i: R.detail_of(int(i)))

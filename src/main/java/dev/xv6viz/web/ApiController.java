@@ -4,7 +4,10 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -29,14 +32,41 @@ public class ApiController {
     }
 
     @GetMapping(value = "/walk", produces = MediaType.APPLICATION_JSON_VALUE)
-    public String walk(@RequestParam String vm, @RequestParam int pid, @RequestParam String va) {
-        if (!va.matches("(0x)?[0-9a-fA-F]{1,16}")) throw new IllegalArgumentException("16진수 주소가 아닙니다: " + va);
-        return vms.get(vm).query("-xv6-walk " + pid + " " + (va.startsWith("0x") ? va : "0x" + va));
+    public String walk(@RequestParam String vm, @RequestParam int pid, @RequestParam String va,
+                       @RequestParam(defaultValue = "user") String root) {
+        if (!va.matches("(0x)?[0-9a-fA-F]{1,16}")) throw new IllegalArgumentException("not a hex address: " + va);
+        if (!root.equals("user") && !root.equals("kernel")) throw new IllegalArgumentException("root must be user or kernel");
+        return vms.get(vm).query("-xv6-walk " + pid + " " + (va.startsWith("0x") ? va : "0x" + va) + " " + root);
     }
 
     @GetMapping(value = "/physmem", produces = MediaType.APPLICATION_JSON_VALUE)
     public String physmem(@RequestParam String vm) {
         return vms.get(vm).query("-xv6-physmem");
+    }
+
+    /** 기록한 시스템 콜 하나: 트랩 단계마다의 레지스터와 스택, 시스템 콜 직후의 프로세스 상태. */
+    @GetMapping(value = "/record", produces = MediaType.APPLICATION_JSON_VALUE)
+    public String record(@RequestParam String vm, @RequestParam int i) {
+        return vms.get(vm).recordDetail(i);
+    }
+
+    /** Source 뷰에서 열 수 있는 파일: kernel/, user/ 아래의 .c .h .S */
+    @GetMapping(value = "/files", produces = MediaType.APPLICATION_JSON_VALUE)
+    public List<String> files(@RequestParam String vm) throws IOException {
+        Path root = vms.get(vm).root();
+        List<String> out = new ArrayList<>();
+        for (String dir : List.of("kernel", "user")) {
+            Path d = root.resolve(dir);
+            if (!Files.isDirectory(d)) continue;
+            try (Stream<Path> s = Files.walk(d)) {
+                s.filter(Files::isRegularFile)
+                        .map(f -> root.relativize(f).toString().replace('\\', '/'))
+                        .filter(f -> f.endsWith(".c") || f.endsWith(".h") || f.endsWith(".S"))
+                        .sorted()
+                        .forEach(out::add);
+            }
+        }
+        return out;
     }
 
     /** xv6 소스 파일. 그 커널 폴더 밖은 읽지 않는다. */
@@ -45,7 +75,7 @@ public class ApiController {
         Vm v = vms.get(vm);
         Path p = v.root().resolve(file).normalize();
         if (!p.startsWith(v.root()) || !Files.isRegularFile(p)) {
-            throw new IllegalArgumentException("소스 파일이 없습니다: " + file);
+            throw new IllegalArgumentException("no such source file: " + file);
         }
         return Files.readString(p, StandardCharsets.UTF_8);
     }

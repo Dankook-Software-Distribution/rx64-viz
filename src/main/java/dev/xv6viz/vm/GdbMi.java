@@ -64,7 +64,7 @@ public final class GdbMi implements AutoCloseable {
         } catch (IOException e) {
             log.debug("gdb 출력 종료", e);
         } finally {
-            pending.values().forEach(f -> f.completeExceptionally(new IOException("gdb가 종료되었습니다")));
+            pending.values().forEach(f -> f.completeExceptionally(new IOException("gdb exited")));
         }
     }
 
@@ -106,7 +106,7 @@ public final class GdbMi implements AutoCloseable {
     /** -xv6-* 명령의 json 결과. */
     public String json(String command) {
         String j = call(command).str("json");
-        if (j == null) throw new GdbException(command + ": json 결과 없음");
+        if (j == null) throw new GdbException(command + ": no json result");
         return j;
     }
 

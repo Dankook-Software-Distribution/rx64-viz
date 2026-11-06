@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ko">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -10,30 +10,26 @@
 <body>
   <header class="bar">
     <b>xv6-viz</b>
-    <nav class="seg" id="views"></nav>
-    <span id="status" class="status"></span>
+    <nav class="seg" id="kernels"></nav>
+    <button type="button" class="menu-btn" id="btn-menu">View</button>
     <span class="right">
-      <button type="button" id="btn-pause">멈추기</button>
-      <label><input type="checkbox" id="chk-refresh" checked> 자동 갱신</label>
-      <button type="button" id="btn-restart">다시 부팅</button>
+      <span class="tg">
+        <button type="button" class="icon" id="tg-left" title="Left side bar  Ctrl+B"><i class="ico l"></i></button>
+        <button type="button" class="icon" id="tg-bottom" title="Panel  Ctrl+J"><i class="ico b"></i></button>
+        <button type="button" class="icon" id="tg-right" title="Right side bar  Ctrl+Alt+B"><i class="ico r"></i></button>
+      </span>
+      <label><input type="checkbox" id="chk-follow" checked> Follow new process</label>
+      <label><input type="checkbox" id="chk-refresh" checked> Auto refresh</label>
+      <button type="button" id="btn-pause">Pause</button>
+      <button type="button" id="btn-restart">Reboot</button>
     </span>
   </header>
   <div class="trace" id="trace"></div>
   <div class="error" id="error" role="alert" hidden></div>
 
-  <main id="single" class="single">
-    <section class="col-left">
-      <div class="pane p-shell"><h2>셸</h2><div class="term-host" id="term-slot"></div></div>
-      <div class="pane"><h2>cpus[]</h2><div class="body" id="cpus"></div></div>
-      <div class="pane p-procs"><h2>proc[]</h2><div class="body" id="procs"></div></div>
-    </section>
-    <section class="pane p-graph"><h2>연결 <span class="sub" id="graph-sub"></span></h2><div class="body graph-body" id="graph"></div></section>
-    <section class="pane p-frames"><h2>스택 <span class="sub" id="frames-sub"></span></h2><div class="body" id="frames"></div></section>
-    <section class="pane p-mem"><h2><span class="seg" id="mem-tabs"></span> <span class="sub" id="mem-sub"></span></h2><div class="body" id="mem"></div></section>
-    <section class="pane p-src"><h2>소스 <span class="sub" id="src-where"></span></h2><div class="body source" id="source"></div></section>
-  </main>
+  <div id="work" class="work"></div>
 
-  <main id="compare" class="compare" hidden></main>
+  <footer class="statusbar"><span id="status" class="status"></span></footer>
 
   <script type="module" src="app.js"></script>
 </body>

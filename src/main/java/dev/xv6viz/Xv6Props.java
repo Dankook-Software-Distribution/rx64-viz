@@ -19,7 +19,7 @@ public record Xv6Props(Map<String, String> kernels, int cpus) {
             kernels.put("riscv", "../rx64-riscv-style");
             kernels.put("x86", "../rx64-x86-style");
         }
-        if (cpus <= 0) cpus = 3;
+        if (cpus <= 0) cpus = 4;
     }
 
     public static Path path(String dir) {
