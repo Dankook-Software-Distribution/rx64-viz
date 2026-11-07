@@ -1,0 +1,13 @@
+# recordings, measurements and server data
+runs/
+
+# build output
+server/build/
+server/.gradle/
+web/node_modules/
+web/dist/
+web/src/vendor/
+__pycache__/
+
+# reference manual (Intel SDM), kept locally only
+*.pdf

@@ -1,0 +1,816 @@
+/* rxviz in VS Code's own clothes: Dark Modern / Light Modern colors,
+   Dark+ / Light+ syntax colors, the debugger's yellow current line and
+   blue "value changed" highlight. */
+
+:root,
+:root[data-theme="dark"] {
+  --editor: #1f1f1f;
+  --side: #181818;
+  --line: #2b2b2b;
+  --text: #cccccc;
+  --dim: #9d9d9d;
+  --faint: #6e7681;
+  --accent: #0078d4;
+  --hover: #2a2d2e;
+  --active-row: #37373d;
+  --input: #313131;
+  --input-border: #3c3c3c;
+  --select: #264f78;
+  --frame-bg: rgba(255, 255, 0, 0.16);
+  --frame-mark: #ffcc00;
+  --changed: #4daafc;
+  --changed-bg: rgba(0, 120, 212, 0.24);
+  --icon-debug: #75beff;
+  --kernel: #c586c0;
+  --user: #4ec9b0;
+  --trap: #ce9178;
+  --bad: #f48771;
+  --status-debug: #0078d4;
+  --tk-keyword: #569cd6;
+  --tk-control: #c586c0;
+  --tk-type: #4ec9b0;
+  --tk-function: #dcdcaa;
+  --tk-variable: #9cdcfe;
+  --tk-constant: #4fc1ff;
+  --tk-string: #ce9178;
+  --tk-number: #b5cea8;
+  --tk-comment: #6a9955;
+  --tk-preproc: #c586c0;
+  --ui: -apple-system, BlinkMacSystemFont, "Segoe WPC", "Segoe UI", "Ubuntu", "Droid Sans", sans-serif;
+  --mono: "Droid Sans Mono", "Cascadia Mono", Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  --editor: #ffffff;
+  --side: #f8f8f8;
+  --line: #e5e5e5;
+  --text: #3b3b3b;
+  --dim: #616161;
+  --faint: #8b949e;
+  --accent: #005fb8;
+  --hover: #f2f2f2;
+  --active-row: #e4e6f1;
+  --input: #ffffff;
+  --input-border: #cecece;
+  --select: #add6ff;
+  --frame-bg: rgba(255, 255, 102, 0.45);
+  --frame-mark: #be8700;
+  --changed: #005fb8;
+  --changed-bg: rgba(0, 95, 184, 0.14);
+  --icon-debug: #007acc;
+  --kernel: #af00db;
+  --user: #267f99;
+  --trap: #a31515;
+  --bad: #c72e0f;
+  --status-debug: #005fb8;
+  --tk-keyword: #0000ff;
+  --tk-control: #af00db;
+  --tk-type: #267f99;
+  --tk-function: #795e26;
+  --tk-variable: #001080;
+  --tk-constant: #0070c1;
+  --tk-string: #a31515;
+  --tk-number: #098658;
+  --tk-comment: #008000;
+  --tk-preproc: #af00db;
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--side);
+  color: var(--text);
+  font: 13px/1.4 var(--ui);
+}
+
+.mono {
+  font-family: var(--mono);
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+#app {
+  display: grid;
+  grid-template-rows: 35px 1fr 22px;
+  height: 100vh;
+}
+
+#dock {
+  min-height: 0;
+}
+
+/* ---------- dockview as VS Code editor groups ---------- */
+
+.dockview-theme-dark,
+.dockview-theme-light {
+  --dv-group-view-background-color: var(--editor);
+  --dv-tabs-and-actions-container-background-color: var(--side);
+  --dv-activegroup-visiblepanel-tab-background-color: var(--editor);
+  --dv-activegroup-hiddenpanel-tab-background-color: var(--side);
+  --dv-inactivegroup-visiblepanel-tab-background-color: var(--editor);
+  --dv-inactivegroup-hiddenpanel-tab-background-color: var(--side);
+  --dv-tab-divider-color: var(--line);
+  --dv-activegroup-visiblepanel-tab-color: var(--text);
+  --dv-activegroup-hiddenpanel-tab-color: var(--dim);
+  --dv-inactivegroup-visiblepanel-tab-color: var(--dim);
+  --dv-inactivegroup-hiddenpanel-tab-color: var(--faint);
+  --dv-separator-border: var(--line);
+  --dv-paneview-header-border-color: var(--line);
+  --dv-tabs-and-actions-container-height: 35px;
+  --dv-tabs-and-actions-container-font-size: 13px;
+  --dv-sash-color: transparent;
+  --dv-active-sash-color: var(--accent);
+  --dv-drag-over-background-color: rgba(83, 89, 93, 0.5);
+  --dv-drag-over-border-color: var(--accent);
+  background: var(--side);
+}
+
+.dv-tab {
+  font-family: var(--ui);
+  border-right: 1px solid var(--line);
+}
+
+.dv-active-tab .dv-default-tab {
+  box-shadow: inset 0 1px 0 var(--accent);
+}
+
+.dv-tabs-and-actions-container {
+  border-bottom: 1px solid var(--line);
+}
+
+/* ---------- title bar ---------- */
+
+#toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 8px;
+  background: var(--side);
+  border-bottom: 1px solid var(--line);
+  min-width: 0;
+}
+
+.app-name {
+  color: var(--dim);
+  padding-right: 4px;
+}
+
+.debug-toolbar {
+  display: flex;
+  padding: 2px;
+  gap: 1px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--editor);
+}
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 24px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  cursor: pointer;
+  color: var(--text);
+}
+
+.debug-toolbar .icon-btn {
+  color: var(--icon-debug);
+}
+
+.icon-btn:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.icon-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.segmented {
+  display: flex;
+  border: 1px solid var(--input-border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.seg {
+  border: 0;
+  background: var(--input);
+  color: var(--dim);
+  padding: 2px 9px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.seg.on {
+  background: var(--accent);
+  color: #ffffff;
+}
+
+.position {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.step-input {
+  width: 104px;
+  height: 24px;
+  padding: 0 6px;
+  background: var(--input);
+  border: 1px solid var(--input-border);
+  border-radius: 2px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  text-align: right;
+}
+
+.step-input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.total {
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.scrubber {
+  flex: 1;
+  min-width: 60px;
+  accent-color: var(--accent);
+}
+
+.scrubber:disabled {
+  opacity: 0.25;
+}
+
+.title-actions {
+  display: flex;
+  gap: 2px;
+}
+
+/* ---------- status bar ---------- */
+
+#statusbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 6px;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--side);
+  border-top: 1px solid var(--line);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+#statusbar.debugging {
+  background: var(--status-debug);
+  border-top-color: var(--status-debug);
+  color: #ffffff;
+}
+
+#statusbar .item {
+  padding: 0 6px;
+}
+
+#statusbar .error {
+  color: var(--bad);
+}
+
+#statusbar.debugging .error {
+  color: #ffffff;
+}
+
+/* ---------- panels ---------- */
+
+.panel {
+  height: 100%;
+  overflow: auto;
+  background: var(--editor);
+}
+
+.panel.history,
+.panel.events,
+.panel.callstack,
+.panel.registers {
+  background: var(--side);
+}
+
+.panel-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 4px 12px;
+  font-size: 12px;
+  color: var(--dim);
+  background: inherit;
+  border-bottom: 1px solid var(--line);
+}
+
+.panel-head:empty {
+  display: none;
+}
+
+.note {
+  padding: 16px;
+  color: var(--dim);
+  max-width: 44ch;
+  font-family: var(--ui);
+  font-size: 13px;
+}
+
+.note-error {
+  color: var(--bad);
+}
+
+.dim {
+  color: var(--dim);
+}
+
+.hint {
+  padding: 2px 12px 6px 24px;
+  color: var(--faint);
+  font-size: 12px;
+}
+
+/* tree glyphs (codicons) */
+.glyph {
+  flex: none;
+  font-size: 14px !important;
+  width: 16px;
+  text-align: center;
+}
+
+.kind-run > .glyph {
+  color: var(--kernel);
+}
+
+.kind-run.user-run > .glyph {
+  color: var(--user);
+}
+
+.kind-call > .glyph {
+  color: #b180d7;
+}
+
+.kind-trap > .glyph {
+  color: var(--trap);
+}
+
+/* History */
+.panel.history .list {
+  padding-top: 4px;
+}
+
+.rec {
+  display: flex;
+  gap: 6px;
+  width: 100%;
+  height: 22px;
+  align-items: center;
+  border: 0;
+  background: none;
+  padding: 0 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.rec-icon {
+  flex: none;
+  font-size: 14px !important;
+  color: var(--dim);
+}
+
+.rec:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.rec:disabled {
+  cursor: default;
+  color: var(--dim);
+}
+
+.rec.open {
+  background: var(--active-row);
+}
+
+.rec-title {
+  flex: 1;
+  font-family: var(--mono);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rec-meta {
+  color: var(--dim);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+
+/* Events */
+.tree {
+  padding: 2px 0 12px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding-right: 8px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.row:hover {
+  background: var(--hover);
+}
+
+.row.active {
+  background: var(--active-row);
+  box-shadow: inset 1px 0 0 var(--frame-mark);
+}
+
+.twisty {
+  flex: none;
+  width: 12px;
+  color: var(--dim);
+  font-size: 10px;
+  text-align: center;
+}
+
+.row .label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.badge {
+  flex: none;
+  font-size: 11px;
+  color: var(--dim);
+  background: var(--active-row);
+  border-radius: 9px;
+  padding: 0 6px;
+}
+
+.len {
+  margin-left: auto;
+  padding-left: 10px;
+  flex: none;
+  font-size: 11px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.row.more {
+  width: 100%;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-size: 12px;
+}
+
+/* Source (editor) */
+.panel.source {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.breadcrumbs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 22px;
+  padding: 0 12px;
+  color: var(--dim);
+  font-size: 12px;
+  flex: none;
+}
+
+.breadcrumbs:empty {
+  display: none;
+}
+
+.breadcrumbs .sep {
+  font-size: 12px;
+  opacity: 0.7;
+}
+
+.breadcrumbs .fn {
+  color: var(--text);
+}
+
+.editor {
+  flex: 1;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 19px;
+  padding-bottom: 40vh;
+}
+
+.src-line {
+  display: grid;
+  grid-template-columns: 18px 5ch 1fr;
+  gap: 0 14px;
+  white-space: pre;
+  padding-right: 16px;
+}
+
+.src-line .ln {
+  color: var(--faint);
+  text-align: right;
+  cursor: pointer;
+}
+
+.src-line.current {
+  background: var(--frame-bg);
+}
+
+.src-line.current .ln {
+  color: var(--text);
+}
+
+.src-line.current .gutter::before,
+.asm.current .gutter::before {
+  content: "";
+  display: block;
+  width: 0;
+  height: 0;
+  margin: 4px 0 0 5px;
+  border-top: 5.5px solid transparent;
+  border-bottom: 5.5px solid transparent;
+  border-left: 8px solid var(--frame-mark);
+}
+
+.tk-keyword { color: var(--tk-keyword); }
+.tk-control { color: var(--tk-control); }
+.tk-type { color: var(--tk-type); }
+.tk-function { color: var(--tk-function); }
+.tk-variable { color: var(--tk-variable); }
+.tk-constant { color: var(--tk-constant); }
+.tk-string { color: var(--tk-string); }
+.tk-number { color: var(--tk-number); }
+.tk-comment { color: var(--tk-comment); }
+.tk-preproc { color: var(--tk-preproc); }
+
+/* instructions of a source line, opened under it */
+.inline-asm {
+  margin: 1px 0 3px calc(18px + 5ch + 28px);
+  border-left: 1px dashed var(--faint);
+  font-size: 12px;
+  line-height: 18px;
+  background: var(--side);
+}
+
+.inline-asm.listing-only {
+  margin-left: 0;
+  border-left: 0;
+  background: none;
+}
+
+.inline-asm .fn {
+  padding: 8px 12px 0;
+  color: var(--tk-function);
+}
+
+.asm {
+  display: grid;
+  grid-template-columns: 18px 17ch 9ch 1fr;
+  gap: 0 8px;
+  padding-right: 12px;
+  white-space: pre;
+}
+
+.asm .addr {
+  color: var(--faint);
+  text-align: right;
+}
+
+.asm .mn {
+  color: var(--tk-keyword);
+}
+
+.asm .ops {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.inline-asm:not(.running) .asm {
+  opacity: 0.75;
+}
+
+.asm.current {
+  background: var(--frame-bg);
+}
+
+.asm-note {
+  padding: 2px 12px;
+  color: var(--faint);
+  font-family: var(--ui);
+  font-size: 12px;
+}
+
+.asm-note.top {
+  padding: 8px 16px;
+}
+
+.src-line .ln:hover {
+  color: var(--text);
+}
+
+/* Registers */
+.regs {
+  padding: 2px 0 12px;
+}
+
+.reg-group h3 {
+  margin: 8px 12px 2px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--dim);
+}
+
+.reg {
+  display: grid;
+  grid-template-columns: 70px minmax(150px, max-content) 1fr;
+  align-items: baseline;
+  gap: 10px;
+  padding: 0 12px;
+  height: 20px;
+}
+
+.reg .name {
+  color: var(--tk-variable);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.reg .val {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.reg .note-text {
+  color: var(--faint);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reg.changed .val {
+  color: var(--changed);
+  background: var(--changed-bg);
+  border-radius: 2px;
+  padding: 0 3px;
+  margin: 0 -3px;
+}
+
+.val.hovered {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Call Stack */
+.frame {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  height: 22px;
+  border: 0;
+  background: none;
+  padding: 0 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.frame:hover {
+  background: var(--hover);
+}
+
+.frame.current {
+  background: var(--active-row);
+}
+
+.frame.current > .glyph {
+  color: var(--frame-mark);
+}
+
+/* Stores */
+.stores-list {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.store {
+  display: grid;
+  grid-template-columns: 12ch 13ch 5ch 20ch 20ch;
+  gap: 8px;
+  width: 100%;
+  height: 20px;
+  align-items: center;
+  border: 0;
+  background: none;
+  padding: 0 12px;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.store.head {
+  cursor: default;
+  font-family: var(--ui);
+  font-size: 11px;
+  color: var(--dim);
+  position: sticky;
+  top: 0;
+  background: var(--editor);
+}
+
+.store:not(.head):hover {
+  background: var(--hover);
+}
+
+.store.changed {
+  background: var(--changed-bg);
+}
+
+/* Console */
+.panel.console {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.term-host {
+  flex: 1;
+  min-height: 0;
+  padding: 4px 0 0 12px;
+}
+
+.term-host .xterm-viewport {
+  background: var(--editor) !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
+}
+
+/* one arrow: on the running instruction when the line is open */
+.src-line.current:has(+ .inline-asm.running .asm.current) .gutter::before {
+  display: none;
+}
+
+/* kernel picker in the title bar */
+.kernel-pick {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.kernel-select {
+  height: 24px;
+  padding: 0 6px;
+  background: var(--input);
+  color: var(--text);
+  border: 1px solid var(--input-border);
+  border-radius: 2px;
+  font: 12px var(--ui);
+}

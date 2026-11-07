@@ -1,0 +1,7 @@
+*.pdf
+os/*/.git
+runs/
+server/build/
+server/.gradle/
+web/node_modules/
+web/dist/

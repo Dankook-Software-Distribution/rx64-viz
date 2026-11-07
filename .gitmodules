@@ -1,0 +1,6 @@
+[submodule "os/rx64-riscv-style"]
+	path = os/rx64-riscv-style
+	url = https://github.com/Dankook-Software-Distribution/rx64-riscv-style.git
+[submodule "os/rx64-x86-style"]
+	path = os/rx64-x86-style
+	url = https://github.com/Dankook-Software-Distribution/rx64-x86-style.git

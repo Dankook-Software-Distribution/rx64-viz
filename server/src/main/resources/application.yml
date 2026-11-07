@@ -1,0 +1,51 @@
+server:
+  port: 8080
+
+spring:
+  web:
+    resources:
+      # the built web UI (web/ -> /work/web in the image)
+      static-locations: file:/work/web/
+
+rxviz:
+  plugin: /work/plugin/rxtrace.so
+  # sessions and their recordings live here
+  data-dir: /data
+  # one guest instruction = 2^shift ns of guest time (QEMU -icount)
+  icount-shift: 3
+  # Per kernel: what the indexer cannot read from the ELF. Exception
+  # vectors 0-31 are named in code (they are the same on every x86).
+  kernels:
+    - id: rx64-x86-style
+      dir: /work/kernels/rx64-x86-style
+      # KSTACK(p) = KSTACKBASE + (2p + 1) * PGSIZE, KSTACKBASE = P2V(PHYSTOP)
+      kstack-base: "0xffffffff88001000"
+      kstack-stride: "0x2000"
+      syscall-vector: 64
+      vectors:
+        "32": timer interrupt
+        "36": uart interrupt
+        "56": virtio disk interrupt
+        "255": spurious interrupt
+    - id: rx64-riscv-style
+      dir: /work/kernels/rx64-riscv-style
+      # KSTACK(p) = CPUENTRY - (p + 1) * 2 * PGSIZE, CPUENTRY = MAXVA - 4 * PGSIZE
+      kstack-base: "0x7fffffffa000"
+      kstack-stride: "-0x2000"
+      syscall-vector: 64
+      vectors:
+        "32": timer interrupt
+        "36": uart interrupt
+        "55": virtio disk interrupt
+        "255": spurious interrupt
+      # TSS rsp0 points at the end of the trapframe in the TRAPFRAME page
+      user-trap-stack-pages: [ "0x7fffffffe000" ]
+      # trampoline.S is linked into the kernel image but runs at TRAMPOLINE
+      aliases:
+        - va: "0x7ffffffff000"
+          symbol: trampoline
+          size: 4096
+  syscalls: [ "", fork, exit, wait, pipe, read, kill, exec, fstat, chdir, dup,
+              getpid, sbrk, pause, uptime, open, write, mknod, unlink, link,
+              mkdir, close, sync ]
+  phys-mem-bytes: 134217728
