@@ -7,7 +7,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
+import java.util.NavigableSet;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -91,6 +93,15 @@ public final class LineTable {
 
     public static boolean isSource(String name) {
         return name.endsWith(".c") || name.endsWith(".h") || name.endsWith(".S");
+    }
+
+    /** The lines of file that some code comes from (empty if none). */
+    public NavigableSet<Integer> linesOf(String file) {
+        TreeSet<Integer> out = new TreeSet<>();
+        for (Src s : rows.values())
+            if (s.file().equals(file))
+                out.add(s.line());
+        return out;
     }
 
     /** The row covering addr, or null. */

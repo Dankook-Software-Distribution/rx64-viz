@@ -29,7 +29,8 @@ public final class SegmentReader {
         /** values[i] for every bit i set in mask (in bit order), nvalues of them. */
         void exec(int vcpu, int id, int mask, long[] values, int nvalues);
 
-        void store(int vcpu, boolean io, int size, long vaddr, long paddr, long lo, long hi);
+        /** cpu: written by the CPU delivering an interrupt/exception (its pushed frame), not by an instruction. */
+        void store(int vcpu, boolean io, boolean cpu, int size, long vaddr, long paddr, long lo, long hi);
 
         void discon(int vcpu, int type, long from, long to);
     }
@@ -146,7 +147,7 @@ public final class SegmentReader {
                     need(size);
                     long lo = uN(Math.min(size, 8));
                     long hi = size > 8 ? uN(size - 8) : 0;
-                    v.store(vcpu, (flags & 1) != 0, size, va, pa, lo, hi);
+                    v.store(vcpu, (flags & 1) != 0, (flags & 2) != 0, size, va, pa, lo, hi);
                 }
                 case 'I' -> {
                     need(13);

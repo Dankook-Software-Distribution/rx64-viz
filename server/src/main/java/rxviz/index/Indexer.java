@@ -30,6 +30,12 @@ public final class Indexer implements SegmentReader.Visitor {
     private int step;
     private long pendingDisc = -1;
     private long userSteps, stores;
+    /* the first user-mode step (and the first one in C code); whether step
+     * 0 is the kernel's entry (a boot) */
+    private int firstUser = -1, firstUserC = -1;
+    private boolean bootRecording;
+    /* user-mode steps per block of Timeline.BLOCK steps */
+    private short[] userBlocks = new short[1024];
     private String name = "";
 
     private Indexer(KernelProfile kernel, MemoryImage image, ChunkStore chunks,
@@ -53,13 +59,16 @@ public final class Indexer implements SegmentReader.Visitor {
         SegmentReader.read(files.trace(), ix);
         chunks.finish();
         Tree t = ix.tree.finish(ix.step);
+        short[] blocks = Arrays.copyOf(ix.userBlocks, (ix.step + Timeline.BLOCK - 1) / Timeline.BLOCK);
         Recording.Summary sum = new Recording.Summary(ix.step, ix.userSteps,
                 ix.step - ix.userSteps, ix.stores, ix.tree.syscalls, ix.tree.interrupts,
                 ix.tree.exceptions, ix.tree.switches, t.size(),
-                chunks.bytesOnDisk() + ckpts.bytesOnDisk(), System.currentTimeMillis() - t0);
+                chunks.bytesOnDisk() + ckpts.bytesOnDisk(), System.currentTimeMillis() - t0,
+                ix.bootRecording || ix.firstUser < 0 ? 0
+                        : ix.firstUserC >= 0 ? ix.firstUserC : ix.firstUser);
         return new Recording(id, command.isEmpty() ? ix.name : command, kernel,
                 ix.regNames, ix.step, ix.insns, chunks, ckpts, t, ix.programs,
-                memSize, image, sum);
+                memSize, image, blocks, sum);
     }
 
     @Override
@@ -110,9 +119,22 @@ public final class Indexer implements SegmentReader.Visitor {
         String fn = "";
         String userFn = null;
         String program = null;
+        if (step == 0 && pc == kernel.bootEntry())
+            bootRecording = true;
         if (cpl == 3) {
+            if (firstUser < 0)
+                firstUser = step;
             userSteps++;
+            int b = step / Timeline.BLOCK;
+            if (b >= userBlocks.length)
+                userBlocks = Arrays.copyOf(userBlocks, Math.max(userBlocks.length * 2, b + 1));
+            userBlocks[b]++;
             Program p = programs.observe(step, regs[iCr3], pc, in.bytes());
+            if (p != null && firstUserC < 0) {
+                var src = kernel.source(pc, true, p);
+                if (src != null && src.file().endsWith(".c"))
+                    firstUserC = step;
+            }
             if (p != null) {
                 program = p.name();
                 userFn = function(in, pc, p);
@@ -139,7 +161,8 @@ public final class Indexer implements SegmentReader.Visitor {
     }
 
     @Override
-    public void store(int vcpu, boolean io, int size, long vaddr, long paddr, long lo, long hi) {
+    public void store(int vcpu, boolean io, boolean cpu, int size, long vaddr, long paddr,
+                      long lo, long hi) {
         if (step == 0 || io || paddr < 0)
             return;
         for (int off = 0; off < size; off += 8) {
@@ -149,6 +172,11 @@ public final class Indexer implements SegmentReader.Visitor {
                 continue;
             long val = off == 0 ? lo : hi;
             long old = image.read(pa, part);
+            /* the plugin reads back one word more than a frame without
+             * an error code; a CPU word that did not change was not
+             * (or need not be) written */
+            if (cpu && val == old)
+                continue;
             image.write(pa, part, val);
             chunks.write(pa, part, val, old);
             stores++;

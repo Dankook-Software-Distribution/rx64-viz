@@ -6,6 +6,11 @@ public final class Addr {
     private Addr() {
     }
 
+    /** "0x1a2b" */
+    public static String hex(long v) {
+        return "0x" + Long.toHexString(v);
+    }
+
     /** base <= a < base + size, unsigned. */
     public static boolean in(long a, long base, long size) {
         return Long.compareUnsigned(a - base, size) < 0 && Long.compareUnsigned(a, base) >= 0;

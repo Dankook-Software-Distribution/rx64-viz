@@ -22,6 +22,7 @@ interface Item {
   icon: string;
   hint: string;
   steps: number | null; // set when ready
+  start: number;
   status: string; // shown when not ready
 }
 
@@ -62,7 +63,7 @@ export class HistoryPanel extends Panel {
     row.disabled = steps === null;
     row.title = steps === null ? it.hint : `${it.hint} (${grouped(steps)} instructions)`;
     if (steps !== null)
-      row.onclick = () => void cursor.open({ id: it.id, kernel, title: it.title, steps });
+      row.onclick = () => void cursor.open({ id: it.id, kernel, title: it.title, steps, start: it.start });
     return row;
   }
 }
@@ -74,6 +75,7 @@ function bootItem(b: BootInfo): Item {
     icon: "debug-start",
     hint: "From the kernel's first instruction to the shell prompt",
     steps: b.status === "READY" ? b.summary?.steps ?? null : null,
+    start: b.summary?.start ?? 0,
     status: BOOT_STATUS[b.status],
   };
 }
@@ -85,6 +87,7 @@ function recItem(r: RecInfo): Item {
     icon: "terminal",
     hint: r.command,
     steps: r.status === "ready" ? r.summary?.steps ?? null : null,
+    start: r.summary?.start ?? 0,
     status: r.status === "recording" ? "running" : r.status,
   };
 }

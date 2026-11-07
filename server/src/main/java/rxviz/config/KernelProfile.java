@@ -5,15 +5,20 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 import rxviz.elf.Addr;
 import rxviz.elf.Disassembly;
 import rxviz.elf.ElfFile;
 import rxviz.elf.LineTable;
+import rxviz.elf.Structs;
 
 /** A kernel build with its symbols, disassembly and user programs loaded. */
 public final class KernelProfile {
@@ -54,6 +59,28 @@ public final class KernelProfile {
     private record Resolved(Program image, long linked) {
     }
 
+    /** A per-CPU stack in the kernel image, [base, base + extent), cut into slices of size bytes. */
+    private record CpuStack(String symbol, long base, long extent, long size) {
+    }
+
+    /**
+     * A stack: what it is (kind: kernel, trap, user, cpu, unknown), a
+     * label for people, and its address range [base, top).
+     */
+    public record StackArea(String kind, String label, long base, long top) {
+    }
+
+    /** A named range of kernel virtual addresses (see what()). */
+    public record Region(long va, long size, String kind, String label) {
+    }
+
+    /**
+     * A system call's C prototype from user/user.h: return type and
+     * parameter types ("int", "const char *", "char **", ...).
+     */
+    public record Proto(String name, String returns, List<String> params) {
+    }
+
     /** One line of a disassembly listing, at its runtime address. */
     public record Line(long addr, String text, String function) {
     }
@@ -78,9 +105,22 @@ public final class KernelProfile {
     private final List<String> syscalls;
     private final List<Alias> aliases = new ArrayList<>();
     private final long[] userTrapStackPages;
+    private final List<CpuStack> cpuStacks = new ArrayList<>();
+    private Structs structs; /* read on first use: a full DWARF dump */
+    private final Set<String> stepSkip;
+    private final List<String> syscallArgs;
+    private final Map<String, Proto> protos = new HashMap<>();
+    private final long directMap;
+    private final List<Region> regions = new ArrayList<>();
+    /* the kernel image's ELF segments, as regions */
+    private final List<Region> imageRegions = new ArrayList<>();
     private final long bootEntry;
 
-    KernelProfile(RxvizProperties.Kernel k, List<String> syscalls) throws IOException {
+    KernelProfile(RxvizProperties.Kernel k, List<String> syscalls, List<String> stepSkip)
+            throws IOException {
+        this.stepSkip = Set.copyOf(stepSkip);
+        this.syscallArgs = k.syscallArgs() == null ? List.of("rdi", "rsi", "rdx", "r10", "r8", "r9")
+                : List.copyOf(k.syscallArgs());
         this.id = k.id();
         this.dir = Path.of(k.dir());
         LineTable.SourceTree src = LineTable.SourceTree.of(dir);
@@ -109,6 +149,30 @@ public final class KernelProfile {
                     throw new IllegalArgumentException(id + ": no symbol " + a.symbol());
                 aliases.add(new Alias(RxvizProperties.hex(a.va()), target, a.size()));
             }
+        if (k.cpuStacks() != null)
+            for (RxvizProperties.CpuStack c : k.cpuStacks()) {
+                long base = kernel.elf().addressOf(c.symbol());
+                if (base == -1)
+                    throw new IllegalArgumentException(id + ": no symbol " + c.symbol());
+                long extent = Math.max(c.size(), kernel.elf().sizeOf(c.symbol()));
+                cpuStacks.add(new CpuStack(c.symbol(), base, extent, c.size()));
+            }
+        Path userH = dir.resolve("user/user.h");
+        if (Files.isRegularFile(userH))
+            for (String line : Files.readAllLines(userH)) {
+                Proto p = parseProto(line);
+                if (p != null)
+                    protos.putIfAbsent(p.name(), p);
+            }
+        this.directMap = k.directMap() == null ? -1 : RxvizProperties.hex(k.directMap());
+        for (ElfFile.Segment s : kernel.elf().segments())
+            imageRegions.add(s.executable()
+                    ? new Region(s.vaddr(), s.memsz(), "kernel-text", "kernel text")
+                    : new Region(s.vaddr(), s.memsz(), "kernel-data", "kernel data"));
+        if (k.regions() != null)
+            for (RxvizProperties.Region g : k.regions())
+                regions.add(new Region(RxvizProperties.hex(g.va()), RxvizProperties.hex(g.size()),
+                        g.kind(), g.label()));
         String entry = k.bootEntry() == null ? "_entry" : k.bootEntry();
         long entryVa = kernel.elf().addressOf(entry);
         this.bootEntry = entryVa == -1 ? -1 : kernel.elf().physOf(entryVa);
@@ -159,6 +223,126 @@ public final class KernelProfile {
         return false;
     }
 
+    private static final Pattern PROTO = Pattern.compile(
+            "^\\s*([A-Za-z_][\\w\\s\\*]*?)\\s*\\b([A-Za-z_]\\w*)\\s*\\(([^)]*)\\)[^;]*;");
+    private static final Set<String> TYPE_WORDS = Set.of("int", "char", "short", "long", "void",
+            "uint", "unsigned", "const", "struct", "uint64", "uint32", "ushort", "uchar");
+
+    /** "int write(int, const void *, int);" -> Proto; parameter names are dropped. */
+    static Proto parseProto(String line) {
+        Matcher m = PROTO.matcher(line);
+        if (!m.find())
+            return null;
+        List<String> params = new ArrayList<>();
+        String ps = m.group(3).trim();
+        if (!ps.isEmpty() && !ps.equals("void") && !ps.contains("..."))
+            for (String p : ps.split(",")) {
+                String t = p.trim().replaceAll("\\s+", " ");
+                String[] w = t.split(" ");
+                String last = w[w.length - 1];
+                /* "int fd" -> "int"; keep "struct stat *", "const char *" */
+                if (w.length >= 2 && last.matches("[A-Za-z_]\\w*") && !TYPE_WORDS.contains(last)
+                        && !w[w.length - 2].equals("struct"))
+                    t = t.substring(0, t.length() - last.length()).trim();
+                params.add(t.replaceAll("\\s*\\*", "*").replaceFirst("\\*", " *"));
+            }
+        return new Proto(m.group(2), m.group(1).trim().replaceAll("\\s+", " "), params);
+    }
+
+    /** The prototype of system call `name` (its stub may be sys_name, as sbrk's), or null. */
+    public Proto syscallProto(String name) {
+        Proto p = protos.get("sys_" + name);
+        return p != null ? p : protos.get(name);
+    }
+
+    /** Registers that carry system call arguments 1..6 (argraw()). */
+    public List<String> syscallArgs() {
+        return syscallArgs;
+    }
+
+    /** Functions the step filter skips (lock helpers). */
+    public Set<String> stepSkip() {
+        return stepSkip;
+    }
+
+    /** The kernel's struct layouts (DWARF), read the first time they are needed. */
+    public synchronized Structs structs() {
+        if (structs == null) {
+            try {
+                structs = Structs.of(kernel.elf());
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        }
+        return structs;
+    }
+
+    /** The kernel image (ELF). */
+    public ElfFile kernelElf() {
+        return kernel.elf();
+    }
+
+    /** Physical address of a kernel virtual address in the direct map of RAM, or -1 if none is configured. */
+    public long directMapToPhys(long va) {
+        return directMap == -1 ? -1 : va - directMap;
+    }
+
+    /**
+     * What a kernel-only page (no U bit) at va is: part of the kernel
+     * image (by its ELF segments), a process's kernel stack, or a
+     * configured region. Null if none of them.
+     */
+    public Region what(long va) {
+        for (Region s : imageRegions)
+            if (Addr.in(va, s.va(), s.size()))
+                return s;
+        int slot = kstackSlot(va + 4096);
+        if (slot >= 0)
+            return new Region(pageOf(va + 4096), 4096, "kstack", "kernel stack of proc[" + slot + "]");
+        for (Region g : regions)
+            if (Addr.in(va, g.va(), g.size()))
+                return g;
+        return null;
+    }
+
+    /** The 4 KB page holding the top word of a stack whose pointer is rsp. */
+    private static long pageOf(long rsp) {
+        return (rsp - 1) & ~0xfffL;
+    }
+
+    /**
+     * The stack rsp points into: a process's kernel stack, the TRAPFRAME
+     * page, a CPU stack in the kernel image, or (user) the user stack
+     * page (USERSTACK = 1). Otherwise the page holding rsp.
+     */
+    public StackArea stackOf(long rsp, boolean user) {
+        long page = pageOf(rsp);
+        int slot = kstackSlot(rsp);
+        if (slot >= 0)
+            return new StackArea("kernel", "kernel stack of proc[" + slot + "]", page, page + 4096);
+        if (isUserTrapStack(rsp))
+            return new StackArea("trap", "TRAPFRAME page", page, page + 4096);
+        if (user)
+            return new StackArea("user", "user stack", page, page + 4096);
+        for (CpuStack c : cpuStacks) {
+            if (Addr.in(rsp - 1, c.base(), c.extent())) {
+                long d = (rsp - 1) - c.base();
+                long cpu = d / c.size();
+                long base = c.base() + cpu * c.size();
+                return new StackArea("cpu", c.symbol() + " (CPU " + cpu + ")", base, base + c.size());
+            }
+        }
+        return new StackArea("unknown", "stack", page, page + 4096);
+    }
+
+    /** x86 exceptions for which the CPU pushes an error code (architectural). */
+    public static boolean hasErrorCode(int vector) {
+        return switch (vector) {
+            case 8, 10, 11, 12, 13, 14, 17, 21, 29, 30 -> true;
+            default -> false;
+        };
+    }
+
     public String vectorName(int vector) {
         String n = vectors.get(vector);
         if (n != null)
@@ -166,6 +350,15 @@ public final class KernelProfile {
         if (vector == syscallVector)
             return "syscall";
         return vector < EXCEPTIONS.length ? EXCEPTIONS[vector] : "vector " + vector;
+    }
+
+    /** What a trap through vector is. */
+    public enum TrapKind { SYSCALL, INTERRUPT, EXCEPTION }
+
+    /** Syscall vector, else exceptions below 32 (architectural), interrupts above. */
+    public TrapKind trapKind(int vector) {
+        return vector == syscallVector ? TrapKind.SYSCALL
+                : vector >= 0 && vector < 32 ? TrapKind.EXCEPTION : TrapKind.INTERRUPT;
     }
 
     public boolean isSyscallVector(int vector) {
@@ -194,6 +387,56 @@ public final class KernelProfile {
         return new Resolved(kernel, low == -1 ? pc : low);
     }
 
+    /** True if pc is where a call instruction returns to. */
+    public boolean isReturnAddress(long pc, boolean user, Program program) {
+        Resolved r = resolve(pc, user, program);
+        return r != null && r.image().disas().followsCall(r.linked());
+    }
+
+    private static final Pattern DIRECT_JUMP =
+            Pattern.compile("^j\\w*\\s+([0-9a-f]+)\\s+<");
+
+    /**
+     * The innermost loop around pc in its function, as compiled: a loop
+     * is the target of backward direct jumps (jmp/jcc) up to the last of
+     * them (a loop often has several: continue, the condition at the
+     * bottom...). The smallest such [target, last jump] holding pc, as
+     * runtime addresses {lo, hi}, or null.
+     */
+    public long[] loopAround(long pc, boolean user, Program program) {
+        Resolved r = resolve(pc, user, program);
+        if (r == null)
+            return null;
+        ElfFile elf = r.image().elf();
+        long a = r.linked();
+        ElfFile.Symbol fn = elf.symbolAt(a);
+        if (fn == null)
+            return null;
+        Map<Long, Long> lastJump = new HashMap<>(); /* loop head -> last back-edge */
+        for (var e : r.image().disas().between(fn.addr(), elf.symbolEnd(fn.addr()))) {
+            Matcher m = DIRECT_JUMP.matcher(e.getValue().replace('\t', ' '));
+            if (!m.find())
+                continue;
+            long target = Long.parseUnsignedLong(m.group(1), 16);
+            if (Long.compareUnsigned(target, e.getKey()) <= 0)
+                lastJump.merge(target, e.getKey(), (x, y) -> Long.compareUnsigned(x, y) >= 0 ? x : y);
+        }
+        long lo = 0, hi = 0;
+        boolean found = false;
+        for (var e : lastJump.entrySet()) {
+            long head = e.getKey(), end = e.getValue();
+            if (Long.compareUnsigned(head, a) > 0 || Long.compareUnsigned(a, end) > 0)
+                continue;
+            if (!found || Long.compareUnsigned(end - head, hi - lo) < 0) {
+                lo = head;
+                hi = end;
+                found = true;
+            }
+        }
+        long delta = pc - a;
+        return found ? new long[] {lo + delta, hi + delta} : null;
+    }
+
     /** Symbol, disassembly and source line for pc. */
     public Location locate(long pc, boolean user, Program program) {
         Resolved r = resolve(pc, user, program);
@@ -218,6 +461,23 @@ public final class KernelProfile {
         Resolved r = resolve(pc, user, program);
         ElfFile.Symbol s = r == null ? null : r.image().elf().symbolAt(r.linked());
         return s == null ? null : s.name();
+    }
+
+    /**
+     * The first line at or after line in file that code comes from, in
+     * the kernel or any user program (a blank line, a comment or a
+     * function's name line has none); -1 if there is none.
+     */
+    public int codeLineAtOrAfter(String file, int line) {
+        int best = -1;
+        List<Program> images = new ArrayList<>(programs);
+        images.add(kernel);
+        for (Program p : images) {
+            Integer l = p.lines().linesOf(file).ceiling(line);
+            if (l != null && (best < 0 || l < best))
+                best = l;
+        }
+        return best;
     }
 
     /** A kernel or user source file, by path relative to the kernel tree. */

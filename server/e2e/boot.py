@@ -46,9 +46,18 @@ for kernel in [k["id"] for k in get("/api/kernels")]:
         main = get(f"/api/recordings/{rid}/state?step={kinit['start']}")["path"][-2]
         kids = [k["label"] for k in get(f"/api/recordings/{rid}/tree?node={main['id']}")]
         check("userinit" in kids, f"main calls {', '.join(kids[:12])}...")
-    runs = [k["label"] for k in get(f"/api/recordings/{rid}/tree?node=-1")]
+    roots = get(f"/api/recordings/{rid}/tree?node=-1")
+    runs = [k["label"] for k in roots]
     check(any("init" in r for r in runs) and any("sh" in r for r in runs),
           f"runs include init and sh: {runs[-4:]}")
+    folded = [k for k in roots if k["kind"] == "run" and k["count"] >= 3]
+    check(bool(folded) and "scheduler" in folded[0]["label"],
+          f"alternating runs folded: {[(k['label'], k['count']) for k in folded]}")
+
+    t = time.time()
+    tl = get(f"/api/recordings/{rid}/timeline?from=0&to={n}&buckets=1000")
+    dt = time.time() - t
+    check(len(tl["lanes"]) >= 2 and dt < 2, f"timeline of all {n:,} steps: {len(tl['lanes'])} lanes in {dt:.2f} s")
 
     for step in (n // 2, n - 1, 1000, n // 3):
         t = time.time()

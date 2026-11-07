@@ -93,7 +93,7 @@ export class ConsolePanel extends Panel {
   private onRecording(r: RecInfo, kernel: string) {
     void shell.refresh();
     if (r.status === "ready" && r.summary)
-      void cursor.open({ id: r.id, kernel, title: r.command, steps: r.summary.steps });
+      void cursor.open({ id: r.id, kernel, title: r.command, steps: r.summary.steps, start: r.summary.start });
   }
 }
 

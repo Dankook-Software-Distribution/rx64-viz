@@ -4,7 +4,8 @@
 // the cursor only expands what is new and moves the mark.
 
 import { api, type TreeNode } from "../api";
-import { cursor, type CursorState } from "../cursor";
+import { cursor, stepFilter, type CursorState } from "../cursor";
+import { shell } from "../shell";
 import { count, grouped } from "../format";
 import { el, GLYPH, note, Panel } from "./panel";
 
@@ -35,6 +36,12 @@ export class EventsPanel extends Panel {
   protected mount() {
     this.element.append(this.list);
     this.onDispose(cursor.subscribe((c) => void this.follow(c)));
+    let first = true;
+    this.onDispose(stepFilter.subscribe(() => {
+      if (first) return void (first = false);
+      this.rid = null; /* reload with or without the filtered calls */
+      void this.follow(cursor.value);
+    }));
   }
 
   private async follow(c: CursorState) {
@@ -45,24 +52,31 @@ export class EventsPanel extends Panel {
     }
     const signal = this.fresh();
     if (c.rec.id !== this.rid) {
-      this.rid = c.rec.id;
+      /* rid is set once the roots are in: a newer move may abort this load */
+      this.rid = null;
       this.roots = [];
       this.byId.clear();
       this.active = null;
       this.list.replaceChildren(note("Loading…"));
       let nodes: TreeNode[];
       try {
-        nodes = await api.tree(c.rec.id, -1, signal);
+        nodes = await api.tree(c.rec.id, -1, stepFilter.value, signal);
       } catch (e) {
         if (!signal.aborted) this.list.replaceChildren(note((e as Error).message, "error"));
         return;
       }
       if (signal.aborted) return;
+      this.rid = c.rec.id;
       this.list.replaceChildren();
       this.roots = nodes.map((n) => this.row(n, 0, this.list));
       if (!nodes.length) this.list.append(note("This recording has no events."));
     }
-    if (c.state) await this.reveal(c.state.path.map((p) => p.id), signal);
+    if (c.state) {
+      /* calls the filter left out are not in the tree: stop at their caller */
+      const hide = new Set(stepFilter.value ? shell.value.kernels.find((k) => k.id === c.rec!.kernel)?.stepSkip ?? [] : []);
+      const path = c.state.path.filter((p) => !(p.kind === "call" && hide.has(p.label)));
+      await this.reveal(path.map((p) => p.id), signal);
+    }
   }
 
   /** Expand along node ids from a root down, and mark the last. */
@@ -103,7 +117,7 @@ export class EventsPanel extends Panel {
       await this.loadGroupUntil(r, PAGE - 1, signal);
       return;
     }
-    const nodes = await api.tree(this.rid, r.node.id, signal);
+    const nodes = await api.tree(this.rid, r.node.id, stepFilter.value, signal);
     if (signal?.aborted || r.children) return;
     r.children = nodes.map((n) => this.row(n, r.depth + 1, r.kidsEl));
   }
@@ -117,7 +131,7 @@ export class EventsPanel extends Panel {
     const parts: number[][] = [];
     for (let i = have; i < want; i += MAX_IDS) parts.push(members.slice(i, Math.min(want, i + MAX_IDS)));
     const rid = this.rid;
-    const loaded = await Promise.all(parts.map((ids) => api.nodes(rid, ids, signal)));
+    const loaded = await Promise.all(parts.map((ids) => api.nodes(rid, ids, stepFilter.value, signal)));
     if (signal?.aborted || (g.children?.length ?? 0) !== have) return;
     g.children ??= [];
     for (const n of loaded.flat()) g.children.push(this.row(n, g.depth + 1, g.kidsEl));
@@ -171,7 +185,7 @@ export class EventsPanel extends Panel {
       void this.toggle(r);
     };
     e.append(twisty, el("span", `glyph codicon codicon-${GLYPH[n.kind]}`));
-    let label = n.label;
+    let label = n.detail ?? n.label;
     if (n.continued) label = "… " + label;
     if (n.suspended) label = label + " …";
     e.append(el("span", "label", label));

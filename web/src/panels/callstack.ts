@@ -27,9 +27,9 @@ export class CallStackPanel extends Panel {
     path.forEach((n, i) => {
       const r = el("button", `frame kind-${n.kind}` + (i === 0 ? " current" : ""));
       r.append(el("span", `glyph codicon codicon-${i === 0 ? "debug-stackframe" : GLYPH[n.kind]}`));
-      r.append(el("span", "label", n.label));
+      r.append(el("span", "label", n.detail ?? n.label));
       r.append(el("span", "len", `step ${grouped(n.start)}`));
-      r.title = `Go to the start of ${n.label}`;
+      r.title = `Go to the start of ${n.detail ?? n.label}`;
       r.onclick = () => void cursor.go(n.start);
       frag.append(r);
     });

@@ -5,7 +5,7 @@
 // shown as instructions only.
 
 import { api, type Line } from "../api";
-import { cursor, type CursorState } from "../cursor";
+import { cursor, runTarget, type CursorState } from "../cursor";
 import { highlight } from "../highlight";
 import { sourceLines } from "../sources";
 import { el, note, Panel, placeholder } from "./panel";
@@ -140,10 +140,14 @@ export class SourcePanel extends Panel {
     html.forEach((h, i) => {
       const r = el("div", "src-line");
       const ln = el("span", "ln", String(i + 1));
-      if (!asm) {
-        ln.title = "Show or hide the instructions of this line";
-        ln.onclick = () => void this.togglePin(i + 1);
-      }
+      ln.title = (asm ? "" : "Click: show or hide the instructions of this line\n")
+        + "Ctrl+click: run to this line (Ctrl+F10); with Shift, back to its last run (Ctrl+Shift+F10)";
+      ln.onclick = (ev) => {
+        runTarget.set({ file: path, line: i + 1 });
+        this.markTarget(i + 1);
+        if (ev.ctrlKey || ev.metaKey) void cursor.runTo(path, i + 1, ev.shiftKey);
+        else if (!asm) void this.togglePin(i + 1);
+      };
       const code = el("span", "code");
       code.innerHTML = h || " ";
       r.append(el("span", "gutter"), ln, code);
@@ -151,6 +155,14 @@ export class SourcePanel extends Panel {
       frag.append(r);
     });
     this.body.replaceChildren(frag);
+    const t = runTarget.value;
+    if (t && t.file === path) this.markTarget(t.line);
+  }
+
+  /** The Run to Cursor line, marked in the gutter. */
+  private markTarget(line: number) {
+    for (const r of this.body.querySelectorAll(".src-line.target")) r.classList.remove("target");
+    this.rows[line - 1]?.classList.add("target");
   }
 
   private markLine(line: number) {

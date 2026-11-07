@@ -42,9 +42,15 @@ public final class Recording {
         public InsnKind kind() { return kind; }
     }
 
+    /** start: where to open it (a command's first user-mode step; 0 for a boot). */
     public record Summary(int steps, long userSteps, long kernelSteps, long stores,
                           int syscalls, int interrupts, int exceptions, int switches,
-                          int nodes, long chunkBytes, long indexMillis) {
+                          int nodes, long chunkBytes, long indexMillis, int start) {
+    }
+
+    /** A store: step, physical address, size in bytes, the value written. */
+    public interface StoreVisitor {
+        void store(int step, long pa, int size, long value);
     }
 
     /** Everything about one step, with its registers decoded once. */
@@ -65,7 +71,7 @@ public final class Recording {
     private final String command;
     private final KernelProfile kernel;
     private final String[] regNames;
-    private final int iCs, iCr3;
+    private final int iCs, iCr3, iCr0;
     private final int steps;
     private final Insns insns;
     private final ChunkStore chunks;
@@ -74,6 +80,8 @@ public final class Recording {
     private final Programs programs;
     private final int memSize;
     private final Summary summary;
+    /* user-mode steps before each block of Timeline.BLOCK steps (prefix sums) */
+    private final long[] userBefore;
 
     private MemoryImage image;
     private int imageStep;
@@ -81,6 +89,7 @@ public final class Recording {
     /* source lines: one small integer per distinct line, per insn id, and
      * per chunk (one key per step) */
     private final Map<LineTable.Src, Integer> srcKey = new HashMap<>();
+    private final List<LineTable.Src> keySrc = new ArrayList<>();
     private final Map<Integer, Integer> insnKey = new HashMap<>();
     private final Map<Integer, int[]> lineChunks = new LinkedHashMap<>(16, 0.75f, true) {
         @Override
@@ -91,13 +100,15 @@ public final class Recording {
 
     Recording(String id, String command, KernelProfile kernel, String[] regNames,
               int steps, Insns insns, ChunkStore chunks, Checkpoints ckpts, Tree tree,
-              Programs programs, int memSize, MemoryImage finalImage, Summary summary) {
+              Programs programs, int memSize, MemoryImage finalImage, short[] userBlocks,
+              Summary summary) {
         this.id = id;
         this.command = command;
         this.kernel = kernel;
         this.regNames = regNames;
         List<String> names = Arrays.asList(regNames);
         this.iCs = names.indexOf("cs");
+        this.iCr0 = names.indexOf("cr0");
         this.iCr3 = names.indexOf("cr3");
         this.steps = steps;
         this.insns = insns;
@@ -107,6 +118,9 @@ public final class Recording {
         this.programs = programs;
         this.memSize = memSize;
         this.summary = summary;
+        this.userBefore = new long[userBlocks.length + 1];
+        for (int i = 0; i < userBlocks.length; i++)
+            userBefore[i + 1] = userBefore[i] + userBlocks[i];
         this.image = finalImage;
         this.imageStep = steps;
         keepImage(this);
@@ -141,11 +155,46 @@ public final class Recording {
         return insns.get(d.insn[step - d.base]);
     }
 
-    /** Page table root (CR3) at step; the last step's for step == steps. */
-    public long cr3(int step) {
+    /** Registers at step (the last step's for step == steps), without locating the instruction. */
+    public long[] registers(int step) {
         int s = Math.min(step, steps - 1);
         check(s);
-        return chunks.chunkOf(s).registers(s)[iCr3];
+        return chunks.chunkOf(s).registers(s);
+    }
+
+    /** Index of a register in registers() and View.regs(), or -1. */
+    public int regIndex(String name) {
+        return Arrays.asList(regNames).indexOf(name);
+    }
+
+    /** Page table root (CR3) at step; the last step's for step == steps. */
+    public long cr3(int step) {
+        return registers(step)[iCr3];
+    }
+
+    /**
+     * Whether paging is on (CR0.PG) at step; the last step's for step ==
+     * steps. While it is off (early boot) addresses are physical.
+     */
+    public boolean paging(int step) {
+        return pagingOn(registers(step));
+    }
+
+    private boolean pagingOn(long[] regs) {
+        return iCr0 < 0 || (regs[iCr0] & 0x80000000L) != 0;
+    }
+
+    /** Runs f on physical memory at step, read through the same interface as virtual(). */
+    public <T> T physical(int step, Function<MemoryImage.Virtual, T> f) {
+        return memory(step, img -> f.apply(img.virtual(0, false)));
+    }
+
+    /** Runs f on virtual memory as the CPU sees it at step (CR3, or physical while paging is off). */
+    public <T> T virtual(int step, Function<MemoryImage.Virtual, T> f) {
+        long[] regs = registers(step);
+        long cr3 = regs[iCr3];
+        boolean on = pagingOn(regs);
+        return memory(step, img -> f.apply(img.virtual(cr3, on)));
     }
 
     /** Source line keys of every step of chunk c (equal keys = same line; -1 unknown). */
@@ -170,9 +219,104 @@ public final class Recording {
         if (user && p == null)
             return -1; /* program not known yet: do not cache */
         LineTable.Src src = kernel.source(insns.get(id).vaddr(), user, p);
-        int key = src == null ? -1 : srcKey.computeIfAbsent(src, x -> srcKey.size());
+        int key = src == null ? -1 : srcKey.computeIfAbsent(src, x -> {
+            keySrc.add(x);
+            return keySrc.size() - 1;
+        });
         insnKey.put(id, key);
         return key;
+    }
+
+    /** The user program running in address space cr3 at step, or null if not known. */
+    public Program programAt(long cr3, int step) {
+        return programs.at(cr3, step);
+    }
+
+    private AddressSpace space; /* the last step asked for */
+
+    private synchronized AddressSpace space(int step) {
+        check(step);
+        if (space == null || space.step != step)
+            space = new AddressSpace(this, step);
+        return space;
+    }
+
+    /** The address space of CR3 at step, as regions (see AddressSpace). */
+    public AddressSpace.Layout addressSpace(int step) {
+        return space(step).map();
+    }
+
+    /** How every physical frame is used at step (see AddressSpace). */
+    public AddressSpace.PhysMap physMap(int step) {
+        return space(step).physMap();
+    }
+
+    /** One physical frame at step: its kind and where CR3's page table maps it. */
+    public AddressSpace.Frame frame(int step, long pa) {
+        return space(step).frame(pa);
+    }
+
+    /**
+     * User-mode steps in [from, to): exact over whole blocks, prorated
+     * over the partial blocks at the ends.
+     */
+    public double userSteps(int from, int to) {
+        return userUpTo(to) - userUpTo(from);
+    }
+
+    private double userUpTo(int s) {
+        int b = s / Timeline.BLOCK;
+        if (b >= userBefore.length - 1)
+            return userBefore[userBefore.length - 1];
+        double part = (double) (s - b * Timeline.BLOCK) / Timeline.BLOCK;
+        return userBefore[b] + part * (userBefore[b + 1] - userBefore[b]);
+    }
+
+    /** The timeline of [from, to) in buckets (see Timeline). */
+    public Timeline.View timeline(int from, int to, int buckets) {
+        return Timeline.of(this, from, to, buckets);
+    }
+
+    /** Every store made by steps in [from, to), oldest first. */
+    public void scanStores(int from, int to, StoreVisitor v) {
+        chunks.forEachWrite(Math.max(0, from), Math.min(to, steps), false, (s, pa, size, nv, ov) -> {
+            v.store(s, pa, size, nv);
+            return true;
+        });
+    }
+
+    private Syscalls syscalls;
+
+    /** The recording's system calls and exceptions (computed once). */
+    public synchronized Syscalls syscalls() {
+        if (syscalls == null)
+            syscalls = Syscalls.of(this);
+        return syscalls;
+    }
+
+    /** The one-line form of a trap node (write(1, "hi", 2) = 2), or null. */
+    public String trapDetail(int node) {
+        if (tree.kind(node) != Tree.INTR)
+            return null;
+        Syscalls.Call c = syscalls().of(node);
+        return c == null ? null : c.detail();
+    }
+
+    /** The stack in use at step, slot by slot (see StackView). */
+    public StackView.Stack stack(int step) {
+        check(step);
+        return new StackView(this).at(step);
+    }
+
+    /** The source line of a line key (see lineKeys), or null. */
+    public synchronized LineTable.Src lineOfKey(int key) {
+        return key >= 0 && key < keySrc.size() ? keySrc.get(key) : null;
+    }
+
+    /** The innermost loop around the instruction of step, as runtime addresses {lo, hi}, or null. */
+    public long[] loopAround(int step) {
+        View v = view(step);
+        return kernel.loopAround(v.insn().vaddr(), v.cpl() == 3, v.program());
     }
 
     /** Static disassembly around the instruction of step. */

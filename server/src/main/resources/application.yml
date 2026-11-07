@@ -22,6 +22,21 @@ rxviz:
       kstack-base: "0xffffffff88001000"
       kstack-stride: "0x2000"
       syscall-vector: 64
+      # argraw() in kernel/syscall.c: the 4th argument comes in r10
+      syscall-args: [ rdi, rsi, rdx, r10, r8, r9 ]
+      # entry.S's boot stack (KSTACKSIZE): CPU 0's scheduler stack
+      cpu-stacks:
+        - symbol: bootstack
+          size: 4096
+      # P2V(0): all of RAM is mapped at KERNBASE + pa
+      direct-map: "0xffffffff80000000"
+      # kernel-only mappings, besides the kernel image and kernel stacks
+      # (memlayout.h); the first match wins
+      regions:
+        - { va: "0xffffffff80000000", size: "0x8000000", kind: ram, label: "RAM at KERNBASE + pa (P2V)" }
+        - { va: "0xfffffffffec00000", size: "0x1000", kind: device, label: "IOAPIC (DEV2V)" }
+        - { va: "0xfffffffffee00000", size: "0x1000", kind: device, label: "LAPIC (DEV2V)" }
+        - { va: "0xffffffff00000000", size: "0x100000000", kind: device, label: "PCI device registers (DEV2V)" }
       vectors:
         "32": timer interrupt
         "36": uart interrupt
@@ -33,6 +48,25 @@ rxviz:
       kstack-base: "0x7fffffffa000"
       kstack-stride: "-0x2000"
       syscall-vector: 64
+      # argraw() in kernel/proc/syscall.c: the 4th argument comes in rcx
+      syscall-args: [ rdi, rsi, rdx, rcx, r8, r9 ]
+      # start.c's stack0[4096 * NCPU]: CPU i runs on the i-th 4096 bytes
+      cpu-stacks:
+        - symbol: stack0
+          size: 4096
+      # the kernel page table maps RAM at its own address
+      direct-map: "0x0"
+      # kernel-only mappings, besides the kernel image and kernel stacks
+      # (memlayout.h); the first match wins
+      regions:
+        - { va: "0x7ffffffff000", size: "0x1000", kind: trampoline, label: "TRAMPOLINE" }
+        - { va: "0x7fffffffe000", size: "0x1000", kind: trapframe, label: "TRAPFRAME" }
+        - { va: "0x7fffffffc000", size: "0x2000", kind: cpuentry, label: "CPUENTRY (GDT, TSS, IDT)" }
+        - { va: "0x8000", size: "0x1000", kind: other, label: "APENTRY (other CPUs' first code)" }
+        - { va: "0x0", size: "0x8000000", kind: ram, label: "RAM at its own address" }
+        - { va: "0xfec00000", size: "0x1000", kind: device, label: "IOAPIC" }
+        - { va: "0xfee00000", size: "0x1000", kind: device, label: "LAPIC" }
+        - { va: "0x8000000", size: "0xf8000000", kind: device, label: "PCI device registers" }
       vectors:
         "32": timer interrupt
         "36": uart interrupt
@@ -49,3 +83,6 @@ rxviz:
               getpid, sbrk, pause, uptime, open, write, mknod, unlink, link,
               mkdir, close, sync ]
   phys-mem-bytes: 134217728
+  # Lock helpers that stepping by line (and Events, with the step filter
+  # on) skips: step into treats a call to them like step over.
+  step-skip: [ acquire, release, push_off, pop_off, holding, mycpu ]

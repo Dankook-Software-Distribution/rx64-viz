@@ -147,20 +147,20 @@ final class TreeBuilder {
         int vector = discTo == pc ? stubVector(fn) : -1;
         if (vector >= 0) {
             pendingCall = false;
-            String lab;
-            if (kernel.isSyscallVector(vector)) {
-                lab = "syscall " + kernel.syscallName(rax);
-                syscalls++;
-            } else if (vector == 14) {
-                lab = "page fault 0x" + Long.toHexString(cr2);
-                exceptions++;
-            } else {
-                lab = kernel.vectorName(vector);
-                if (vector >= 32)
-                    interrupts++;
-                else
+            String lab = switch (kernel.trapKind(vector)) {
+                case SYSCALL -> {
+                    syscalls++;
+                    yield "syscall " + kernel.syscallName(rax);
+                }
+                case EXCEPTION -> {
                     exceptions++;
-            }
+                    yield vector == 14 ? "page fault 0x" + Long.toHexString(cr2) : kernel.vectorName(vector);
+                }
+                case INTERRUPT -> {
+                    interrupts++;
+                    yield kernel.vectorName(vector);
+                }
+            };
             int node = open(Tree.INTR, i, lab);
             t.vector[node] = vector;
         } else if (pendingCall) {

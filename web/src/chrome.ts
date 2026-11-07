@@ -2,7 +2,7 @@
 // the recording, and the status bar.
 
 import type { StepOp } from "./api";
-import { cursor, stepping, type CursorState, type Granularity } from "./cursor";
+import { cursor, runTarget, stepFilter, stepping, type CursorState, type Granularity } from "./cursor";
 import { grouped, hex, ring } from "./format";
 import { el } from "./panels/panel";
 import { shell } from "./shell";
@@ -22,12 +22,16 @@ const ACTIONS: Action[] = [
   { icon: "debug-step-back", title: "Step back",
     keys: "←", match: (e) => e.key === "ArrowLeft", run: () => stepping.op("back") },
   { icon: "debug-step-over", title: "Step over: calls and traps run without stopping",
-    keys: "F10", match: (e) => e.key === "F10", run: () => stepping.op("over") },
+    keys: "F10", match: (e) => e.key === "F10" && !e.altKey && !e.ctrlKey, run: () => stepping.op("over") },
   { icon: "debug-step-into", title: "Step into",
     keys: "F11 or →", match: (e) => (e.key === "F11" && !e.shiftKey) || e.key === "ArrowRight",
     run: () => stepping.op("into") },
   { icon: "debug-step-out", title: "Step out of the current function or trap",
     keys: "Shift+F11", match: (e) => e.key === "F11" && e.shiftKey, run: () => "out" },
+  { icon: "run-above", title: "Back to before this loop: the last step of this function before the loop around the current instruction was entered",
+    keys: "Alt+Shift+F10", match: (e) => e.key === "F10" && e.altKey && e.shiftKey, run: () => "loop-back" },
+  { icon: "run-below", title: "Step over loop: run until the loop around the current instruction is left (calls in it run without stopping)",
+    keys: "Alt+F10", match: (e) => e.key === "F10" && e.altKey && !e.shiftKey, run: () => "loop-out" },
   { icon: "debug-continue", title: "Next trap: forward to the next interrupt, exception or syscall",
     keys: "]", match: (e) => e.key === "]", run: () => "next-trap" },
 ];
@@ -107,6 +111,19 @@ export function toolbar(host: HTMLElement, actions: { resetLayout(): void; toggl
   });
   host.append(gran);
 
+  const filter = el("button", "icon-btn toggle");
+  filter.append(icon("filter"));
+  shell.subscribe((s) => {
+    const names = s.kernels[0]?.stepSkip.join(", ") ?? "";
+    filter.title = `Skip lock helpers (${names}) when stepping by line and in Events`;
+  });
+  filter.onclick = () => stepFilter.set(!stepFilter.value);
+  stepFilter.subscribe((on) => {
+    filter.classList.toggle("on", on);
+    filter.setAttribute("aria-pressed", String(on));
+  });
+  host.append(filter);
+
   const pos = el("div", "position");
   const input = el("input", "step-input");
   input.type = "text";
@@ -164,6 +181,12 @@ export function toolbar(host: HTMLElement, actions: { resetLayout(): void; toggl
   window.addEventListener("keydown", (ev) => {
     const t = ev.target as HTMLElement;
     if (t.closest("input, textarea, .xterm")) return;
+    if (ev.key === "F10" && (ev.ctrlKey || ev.metaKey)) {
+      ev.preventDefault();
+      const target = runTarget.value;
+      if (target) void cursor.runTo(target.file, target.line, ev.shiftKey);
+      return;
+    }
     const a = ACTIONS.find((x) => x.match(ev));
     if (!a) return;
     ev.preventDefault();
@@ -183,6 +206,11 @@ export function statusbar(host: HTMLElement) {
     };
     if (c.error) {
       item(c.error, "error");
+      return;
+    }
+    if (c.busy) {
+      const b = item("");
+      b.append(el("span", "codicon codicon-loading codicon-modifier-spin"), document.createTextNode(` ${c.busy}`));
       return;
     }
     if (!c.rec) {

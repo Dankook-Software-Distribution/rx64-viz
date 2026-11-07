@@ -6,6 +6,7 @@ import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import com.github.luben.zstd.ZstdInputStream;
@@ -33,15 +34,19 @@ public final class MemoryImage {
                 off += r;
             }
         }
-        java.util.Arrays.fill(mem, off, mem.length, (byte) 0);
+        Arrays.fill(mem, off, mem.length, (byte) 0);
     }
 
     void clear() {
-        java.util.Arrays.fill(mem, (byte) 0);
+        Arrays.fill(mem, (byte) 0);
     }
 
     void writeTo(OutputStream out) throws IOException {
         out.write(mem);
+    }
+
+    public long size() {
+        return mem.length;
     }
 
     public boolean contains(long pa, int len) {
@@ -103,8 +108,136 @@ public final class MemoryImage {
         return new Walk(va, cr3, levels, -1, 0);
     }
 
-    /** Physical address of va, or -1. */
+    /** What enumerate() finds: tables (level 0 = PML4) and leaf mappings with their effective rights. */
+    public interface Mappings {
+        void table(long pa, int level);
+
+        void leaf(long va, long pa, long size, boolean writable, boolean user, boolean noExecute,
+                  long entry);
+    }
+
+    /**
+     * Every present mapping of the page table at cr3, in address order
+     * (lower half first). A right holds only if every level grants it
+     * (NX: if any level sets it), as the MMU checks them.
+     */
+    public void enumerate(long cr3, Mappings out) {
+        enumerate(cr3 & ADDR_MASK, 0, 0, true, true, false, out);
+    }
+
+    private void enumerate(long table, int level, long base, boolean w, boolean u, boolean nx,
+                           Mappings out) {
+        if (!contains(table, 4096))
+            return;
+        out.table(table, level);
+        int shift = 39 - 9 * level;
+        for (int i = 0; i < 512; i++) {
+            long e = read(table + 8L * i, 8);
+            if ((e & 1) == 0)
+                continue;
+            long va = base | ((long) i << shift);
+            if (level == 0 && (va & (1L << 47)) != 0)
+                va |= 0xffff000000000000L; /* canonical upper half */
+            boolean w2 = w && (e & 2) != 0, u2 = u && (e & 4) != 0, nx2 = nx || e < 0;
+            if (level == 3 || (level > 0 && (e & 0x80) != 0)) {
+                long size = 1L << shift;
+                out.leaf(va, (e & ADDR_MASK) & ~(size - 1), size, w2, u2, nx2, e);
+            } else {
+                enumerate(e & ADDR_MASK, level + 1, va, w2, u2, nx2, out);
+            }
+        }
+    }
+
+    /** Physical address of va through the page table at cr3, or -1 (like walk(), without the levels). */
     public long translate(long cr3, long va) {
-        return walk(cr3, va).pa();
+        long table = cr3 & ADDR_MASK;
+        for (int l = 0; l < 4; l++) {
+            int shift = 39 - 9 * l;
+            long ea = table + 8L * ((va >>> shift) & 0x1ff);
+            if (!contains(ea, 8))
+                return -1;
+            long e = read(ea, 8);
+            if ((e & 1) == 0)
+                return -1;
+            if (l == 3 || (l > 0 && (e & 0x80) != 0)) {
+                long size = 1L << shift;
+                return ((e & ADDR_MASK) & ~(size - 1)) | (va & (size - 1));
+            }
+            table = e & ADDR_MASK;
+        }
+        return -1;
+    }
+
+    /** Virtual memory as the page table at cr3 maps it; while paging is off, addresses are physical. */
+    public Virtual virtual(long cr3, boolean paging) {
+        return new Virtual(cr3, paging);
+    }
+
+    /** Reads virtual addresses, translating once per 4 KB page. */
+    public final class Virtual {
+        private final long cr3;
+        private final boolean paging;
+        private long page = -1, pagePa = -1;
+
+        private Virtual(long cr3, boolean paging) {
+            this.cr3 = cr3;
+            this.paging = paging;
+        }
+
+        public MemoryImage image() {
+            return MemoryImage.this;
+        }
+
+        /** Physical address of va, or -1 if it is not mapped. */
+        public long pa(long va) {
+            long p = va & ~0xfffL;
+            if (p != page) {
+                page = p;
+                pagePa = paging ? translate(cr3, p) : p;
+            }
+            return pagePa < 0 ? -1 : pagePa | (va & 0xfff);
+        }
+
+        /** The byte at va, or -1 if it is not mapped (or not in RAM). */
+        public int byteAt(long va) {
+            long p = pa(va);
+            return p >= 0 && contains(p, 1) ? mem[(int) p] & 0xff : -1;
+        }
+
+        /** The little-endian word of size bytes at va, or null if any byte is not mapped. */
+        public Long read(long va, int size) {
+            long v = 0;
+            for (int i = 0; i < size; i++) {
+                int b = byteAt(va + i);
+                if (b < 0)
+                    return null;
+                v |= (long) b << (8 * i);
+            }
+            return v;
+        }
+
+        /** Up to n bytes at va, fewer if an unmapped page comes first. */
+        public byte[] bytes(long va, int n) {
+            byte[] out = new byte[n];
+            for (int i = 0; i < n; i++) {
+                int b = byteAt(va + i);
+                if (b < 0)
+                    return Arrays.copyOf(out, i);
+                out[i] = (byte) b;
+            }
+            return out;
+        }
+
+        /** The NUL-terminated string at va, at most max bytes. */
+        public String cstring(long va, int max) {
+            StringBuilder b = new StringBuilder();
+            for (int i = 0; i < max; i++) {
+                int c = byteAt(va + i);
+                if (c <= 0)
+                    break;
+                b.append((char) c);
+            }
+            return b.toString();
+        }
     }
 }

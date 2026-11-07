@@ -67,6 +67,14 @@ public final class Disassembly {
         return text.get(addr);
     }
 
+    /** True if the instruction just before addr is a call (addr is where it returns). */
+    public boolean followsCall(long addr) {
+        if (!text.containsKey(addr))
+            return false;
+        Map.Entry<Long, String> e = text.lowerEntry(addr);
+        return e != null && e.getValue().startsWith("call");
+    }
+
     /** Instructions with from <= address < to. */
     public List<Map.Entry<Long, String>> between(long from, long to) {
         return new ArrayList<>(text.subMap(from, true, to, false).entrySet());

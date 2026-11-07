@@ -39,6 +39,24 @@ export abstract class Panel implements IContentRenderer {
     return this.request.signal;
   }
 
+  /** True if the panel is on screen (its tab is the active one). */
+  protected visible(): boolean {
+    return this.element.offsetWidth > 0 && this.element.offsetHeight > 0;
+  }
+
+  /** Run fn whenever the panel's size changes, including when its tab is shown. */
+  protected onResize(fn: () => void) {
+    const ro = new ResizeObserver(fn);
+    ro.observe(this.element);
+    this.onDispose(() => ro.disconnect());
+  }
+
+  /** Run fn when the user switches between dark and light. */
+  protected onTheme(fn: () => void) {
+    window.addEventListener("rx-theme", fn);
+    this.onDispose(() => window.removeEventListener("rx-theme", fn));
+  }
+
   dispose(): void {
     this.request?.abort();
     for (const fn of this.cleanups) fn();
@@ -56,6 +74,23 @@ export function el<K extends keyof HTMLElementTagNameMap>(
   if (className) e.className = className;
   if (text !== undefined) e.textContent = text;
   return e;
+}
+
+/** A CSS custom property of the current theme (a color such as --kernel). */
+export function cssVar(name: string): string {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+/** Size a canvas to w x h CSS pixels at the screen's pixel ratio; its 2D context, scaled. */
+export function sizeCanvas(canvas: HTMLCanvasElement, w: number, h: number): CanvasRenderingContext2D {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  canvas.style.width = `${w}px`;
+  canvas.style.height = `${h}px`;
+  const ctx = canvas.getContext("2d")!;
+  ctx.scale(dpr, dpr);
+  return ctx;
 }
 
 /** A centered note for empty or failed panels. */

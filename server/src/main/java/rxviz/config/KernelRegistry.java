@@ -3,6 +3,7 @@ package rxviz.config;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 import org.slf4j.Logger;
@@ -20,7 +21,8 @@ public class KernelRegistry {
     public KernelRegistry(RxvizProperties props) {
         for (RxvizProperties.Kernel k : props.kernels()) {
             try {
-                KernelProfile p = new KernelProfile(k, props.syscalls());
+                KernelProfile p = new KernelProfile(k, props.syscalls(),
+                        props.stepSkip() == null ? List.of() : props.stepSkip());
                 kernels.put(p.id(), p);
                 log.info("kernel {}: {} user programs", p.id(), p.programs().size());
             } catch (IOException e) {

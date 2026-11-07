@@ -33,6 +33,8 @@ public final class Tree {
     private int[] childStart;
     private int[] childIdx;
     private int[] roots;
+    /* INTR nodes that start a trap (not continued), in start order */
+    private int[] traps;
 
     int add(byte k, int par, int st, int thr, String lab) {
         if (n == start.length) {
@@ -69,6 +71,14 @@ public final class Tree {
         for (int i = 0; i < n; i++)
             childStart[i + 1] = childStart[i] + count[i];
         childIdx = new int[childStart[n]];
+        int ntraps = 0;
+        for (int i = 0; i < n; i++)
+            if (kind[i] == INTR && (flags[i] & CONTINUED) == 0)
+                ntraps++;
+        traps = new int[ntraps];
+        for (int i = 0, k = 0; i < n; i++)
+            if (kind[i] == INTR && (flags[i] & CONTINUED) == 0)
+                traps[k++] = i;
         int[] fill = Arrays.copyOf(childStart, n);
         roots = new int[nroots];
         int r = 0;
@@ -88,6 +98,13 @@ public final class Tree {
     public byte flags(int i) { return flags[i]; }
     public int vector(int i) { return vector[i]; }
     public String label(int i) { return label.get(i); }
+    public int thread(int i) { return thread[i]; }
+
+    /** Runs (roots), in start order. Do not modify. */
+    int[] runs() { return roots; }
+
+    /** Nodes that start a trap, in start order. Do not modify. */
+    int[] traps() { return traps; }
 
     public int[] children(int i) {
         if (i < 0)
@@ -173,6 +190,44 @@ public final class Tree {
         while (k > d) {
             i = parent[i];
             k--;
+        }
+        return i;
+    }
+
+    /**
+     * The node where the frame of node i really started: i itself, or for
+     * a CONTINUED node (reopened when its thread was switched back in),
+     * the same frame in the thread's earlier runs. -1 if not found.
+     */
+    public int origin(int i) {
+        int d = depth(i);
+        while ((flags[i] & CONTINUED) != 0) {
+            int prev = prevRunOfThread(ancestorAtDepth(i, 0));
+            if (prev < 0 || end[prev] <= start[prev])
+                return -1;
+            int c = ancestorAtDepth(innermost(end[prev] - 1), d);
+            if (c < 0 || kind[c] != kind[i] || !label(c).equals(label(i)))
+                return -1;
+            i = c;
+        }
+        return i;
+    }
+
+    /**
+     * The last part of node i's frame: i itself, or, if it was switched
+     * out (SUSPENDED), its continuation in the thread's last run that has
+     * it. The mirror of origin().
+     */
+    public int lastPart(int i) {
+        int d = depth(i);
+        while ((flags[i] & SUSPENDED) != 0) {
+            int run = nextRunOfThread(ancestorAtDepth(i, 0));
+            if (run < 0)
+                break;
+            int c = ancestorAtDepth(innermost(start[run]), d);
+            if (c < 0 || kind[c] != kind[i] || !label(c).equals(label(i)))
+                break;
+            i = c;
         }
         return i;
     }

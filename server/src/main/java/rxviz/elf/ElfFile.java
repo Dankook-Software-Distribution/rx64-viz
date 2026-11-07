@@ -19,7 +19,9 @@ import java.util.Map;
  */
 public final class ElfFile {
 
-    public record Segment(long vaddr, long paddr, long offset, long filesz, long memsz) {
+    /** A PT_LOAD segment; flags: PF_X 1, PF_W 2, PF_R 4. */
+    public record Segment(long vaddr, long paddr, long offset, long filesz, long memsz, int flags) {
+        public boolean executable() { return (flags & 1) != 0; }
     }
 
     public record Symbol(String name, long addr, long size) {
@@ -32,6 +34,7 @@ public final class ElfFile {
     private final long[] symAddr;
     private final Symbol[] syms;
     private final Map<String, Long> byName = new HashMap<>();
+    private final Map<String, Long> sizeByName = new HashMap<>();
 
     private ElfFile(String name, Path path, byte[] data) {
         this.name = name;
@@ -52,7 +55,7 @@ public final class ElfFile {
             int p = (int) (phoff + (long) i * phentsize);
             if (b.getInt(p) == 1) /* PT_LOAD */
                 loads.add(new Segment(b.getLong(p + 16), b.getLong(p + 24), b.getLong(p + 8),
-                        b.getLong(p + 32), b.getLong(p + 40)));
+                        b.getLong(p + 32), b.getLong(p + 40), b.getInt(p + 4)));
         }
 
         List<Symbol> list = new ArrayList<>();
@@ -74,14 +77,17 @@ public final class ElfFile {
                 long symSize = b.getLong(p + 16);
                 /* SHN_UNDEF, and SHN_ABS etc. (assembler counters like
                  * trampoline.S's ".set i, i+1") are not code */
-                if (shndx == 0 || shndx >= 0xff00 || (type != 0 && type != 2))
-                    continue; /* keep defined NOTYPE (asm labels) and FUNC;
-                                 user programs start at address 0 */
+                if (shndx == 0 || shndx >= 0xff00 || type > 2)
+                    continue;
                 String n = cstring((int) (stroff + nameOff));
                 if (n.isEmpty() || n.startsWith(".") || n.startsWith("$"))
                     continue;
-                list.add(new Symbol(n, value, symSize));
                 byName.putIfAbsent(n, value);
+                sizeByName.putIfAbsent(n, symSize);
+                /* code symbols: defined NOTYPE (asm labels) and FUNC;
+                   user programs start at address 0 */
+                if (type != 1)
+                    list.add(new Symbol(n, value, symSize));
             }
         }
         /* by address; on ties prefer the one with a size (the C function) */
@@ -135,6 +141,16 @@ public final class ElfFile {
     /** Address of the named symbol, or -1. */
     public long addressOf(String symbol) {
         return byName.getOrDefault(symbol, -1L);
+    }
+
+    /** The loadable segments. */
+    public List<Segment> segments() {
+        return loads;
+    }
+
+    /** Size of the named symbol (0 for most assembler labels), or -1. */
+    public long sizeOf(String symbol) {
+        return sizeByName.getOrDefault(symbol, -1L);
     }
 
     /** Load (physical) address of virtual address va, or -1. */

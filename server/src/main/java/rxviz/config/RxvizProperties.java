@@ -13,7 +13,8 @@ public record RxvizProperties(
         int icountShift,
         List<Kernel> kernels,
         List<String> syscalls,
-        long physMemBytes) {
+        long physMemBytes,
+        List<String> stepSkip) {
 
     /** One kernel tree under /work/kernels and the facts the indexer needs about it. */
     public record Kernel(
@@ -22,10 +23,25 @@ public record RxvizProperties(
             String kstackBase,
             String kstackStride,
             int syscallVector,
+            List<String> syscallArgs,
             Map<Integer, String> vectors,
             List<Alias> aliases,
             List<String> userTrapStackPages,
+            List<CpuStack> cpuStacks,
+            String directMap,
+            List<Region> regions,
             String bootEntry) {
+    }
+
+    /**
+     * A kernel-only virtual address range and what it is (kind: ram,
+     * device, trampoline, trapframe, cpuentry, ...). The first match wins.
+     */
+    public record Region(String va, String size, String kind, String label) {
+    }
+
+    /** Per-CPU stacks in the kernel image: symbol, divided into slices of size bytes (CPU 0 first). */
+    public record CpuStack(String symbol, long size) {
     }
 
     /** Code linked at symbol but executed at [va, va + size), mapped at run time. */

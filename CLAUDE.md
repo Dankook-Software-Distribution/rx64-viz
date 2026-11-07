@@ -56,6 +56,7 @@ python3 server/e2e/e2e.py && python3 server/e2e/boot.py && node server/e2e/ws.mj
 ## Things that are easy to get wrong
 
 - QEMU must run with `-icount` (set in `Qemu.java`): without it, the slowed, traced guest drowns in timer interrupts and stalls.
+- Plugins get memory callbacks only for instructions: the frame the CPU pushes on an interrupt/exception is read back by the plugin ('W' flags 2); device DMA (virtio disk reads) and the accessed/dirty bits the MMU sets in page-table entries are not recorded at all (so the UI does not show A/D).
 - QEMU's plugin disassembly is empty (Ubuntu's QEMU has no capstone): instruction kinds come from the bytes (`InsnKind`), text from objdump.
 - Addresses are unsigned 64-bit: use `elf/Addr` helpers and `Long.compareUnsigned`; kernel addresses are negative longs. JSON carries 64-bit values as `"0x..."` strings.
 - "State at step N" is the state before instruction N runs.
@@ -65,8 +66,10 @@ python3 server/e2e/e2e.py && python3 server/e2e/boot.py && node server/e2e/ws.mj
 
 ## Status and next steps
 
-Done: tracer, indexer, REST/WebSocket API, boot recordings from `_entry`, UI with History, Events, Code (C with inline instructions), Registers, Call Stack, Console, Stores.
+Done: tracer, indexer, REST/WebSocket API, boot recordings from `_entry`, UI with History, Events, Code (C with inline instructions), Registers, Call Stack, Console, Stores, Stack (`index/StackView`: frames from the event tree plus the saved-rbp chain, trapframe field names from DWARF via `elf/Structs`), Memory (`index/AddressSpace`: regions of CR3's page table, physical frame map with the real `kmem.freelist`; region names from ELF segments, kstack slots, exec's layout and `regions:` in `application.yml`).
 
-Next (phase 3b, design to be agreed first): Stack view, Memory view (virtual address space, page-table walk and physical memory in one view; needs `/regions`, `/physmap`, `/stack` APIs), Timeline; fold long alternating scheduler/process runs in Events. Later (3c): Processes, CPU structures (GDT/IDT/TSS), side-by-side kernel comparison.
+Timeline (`index/Timeline`: per-thread lanes bucketed on the server, user-mode share from per-256-step counts made while indexing), Events folds runs of threads that take turns. Step filter (title-bar toggle, on by default): line stepping and Events skip the lock helpers in `step-skip` (`application.yml`); Instruction mode never skips. Syscalls (`index/Syscalls`: args from `syscall-args` registers typed by `user/user.h`, strings read at entry, pointer outputs from the call's recorded stores, result = rax on return; also exceptions with the CPU's error code), shown in a Syscalls panel, event-tree `detail`, Call Stack and Timeline; command recordings open at their first user-mode C line (`Summary.start`). Loop stepping (`loop-out`/`loop-back`: a loop = a backward-jump target up to its last back-edge, from objdump) and Run to Cursor (`/run-to`, scans the whole recording in time order, ~15 s worst case on a boot). While CR0.PG is off (early boot) Stack/Memory treat addresses as physical (`Recording.paging`).
+
+Next (3c, design to be agreed first): Processes, CPU structures (GDT/IDT/TSS), side-by-side kernel comparison.
 
 Known shortcuts worth revisiting: thread identity is inferred from the stack in use (could come from `swtch`'s arguments); exec is detected when the running program's code changes (could come from a CR3 change on syscall return); indexes are rebuilt on every server start.

@@ -39,6 +39,11 @@
  *       first 'X' of a segment carries every register.
  *   'W' u8 vcpu, u8 flags(1=io), u8 size, u64 vaddr, u64 paddr, bytes
  *                                                    store by the last 'X'
+ *       flags 2: written by the CPU itself while delivering an interrupt
+ *       or exception (the frame it pushes: [err,] rip, cs, rflags, rsp,
+ *       ss). Plugins see no memory callback for those, so the 6 words at
+ *       rsp are read back before the handler's first 'X'; the last one
+ *       is only part of the frame if there was an error code.
  *   'D' u8 vcpu, u8 type(1=interrupt,2=exception), u64 from, u64 to
  *                                                    control transfer that
  *                                                    is not an instruction
@@ -74,6 +79,8 @@ struct vcpu {
     struct qemu_plugin_register *reg[MAXREGS];
     const char *name[MAXREGS];
     uint64_t last[MAXREGS];
+    int rsp;                /* index of rsp in reg[], or -1 */
+    gboolean trap_frame;    /* an interrupt/exception was just delivered */
     GByteArray *buf;
 };
 
@@ -345,6 +352,7 @@ static void vcpu_init(qemu_plugin_id_t id, unsigned int vi)
         return;
     struct vcpu *v = &vcpus[vi];
     v->buf = g_byte_array_new();
+    v->rsp = -1;
     GArray *regs = qemu_plugin_get_registers();
     for (int w = 0; want_regs[w] && v->nregs < MAXREGS; w++) {
         for (guint i = 0; i < regs->len; i++) {
@@ -354,6 +362,8 @@ static void vcpu_init(qemu_plugin_id_t id, unsigned int vi)
                 v->reg[v->nregs] = d->handle;
                 v->name[v->nregs] = want_regs[w];
                 v->last[v->nregs] = ~0ull;
+                if (strcmp(want_regs[w], "rsp") == 0)
+                    v->rsp = v->nregs;
                 v->nregs++;
                 break;
             }
@@ -375,6 +385,42 @@ static gboolean is_arm_id(uint32_t iid)
     return FALSE;
 }
 
+/* The frame the CPU pushed when it delivered an interrupt/exception,
+ * as stores of the step before the handler (see 'W' flags 2). */
+static void cpu_pushed_frame(struct vcpu *v, unsigned int vi)
+{
+    g_byte_array_set_size(v->buf, 0);
+    if (v->rsp < 0 || qemu_plugin_read_register(v->reg[v->rsp], v->buf) < 8)
+        return;
+    uint64_t rsp;
+    memcpy(&rsp, v->buf->data, 8);
+    /* the word above a frame without an error code may be past the top
+     * of the stack (a guard page): read it on its own */
+    uint64_t words[6];
+    int n = 0;
+    for (int i = 0; i < 6; i++) {
+        g_byte_array_set_size(v->buf, 0);
+        if (!qemu_plugin_read_memory_vaddr(rsp + 8 * i, v->buf, 8))
+            break;
+        memcpy(&words[i], v->buf->data, 8);
+        n++;
+    }
+    for (int i = 0; i < n; i++) {
+        uint64_t va = rsp + 8 * i, pa;
+        if (!qemu_plugin_translate_vaddr(va, &pa))
+            continue;
+        struct rec r = {.n = 0};
+        put8(&r, 'W');
+        put8(&r, vi);
+        put8(&r, 2);
+        put8(&r, 8);
+        put64(&r, va);
+        put64(&r, pa);
+        put64(&r, words[i]);
+        emit(r.b, r.n);
+    }
+}
+
 static void insn_exec(unsigned int vi, void *udata)
 {
     check_marks();
@@ -388,6 +434,10 @@ static void insn_exec(unsigned int vi, void *udata)
         if (snap_pending)
             snapshot();
         g_mutex_unlock(&out_lock);
+    }
+    if (mode == MODE_FULL && vi < MAXVCPU && vcpus[vi].trap_frame) {
+        vcpus[vi].trap_frame = FALSE;
+        cpu_pushed_frame(&vcpus[vi], vi);
     }
     struct rec r = {.n = 0};
     put8(&r, 'X');
@@ -461,6 +511,8 @@ static void discon(qemu_plugin_id_t id, unsigned int vi,
         qemu_plugin_u64_add(c_excs, vi, 1);
     if (mode == MODE_COUNT || !armed)
         return;
+    if (mode == MODE_FULL && vi < MAXVCPU)
+        vcpus[vi].trap_frame = TRUE;
     struct rec r = {.n = 0};
     put8(&r, 'D');
     put8(&r, vi);
