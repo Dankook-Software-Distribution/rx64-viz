@@ -34,8 +34,13 @@ import rxviz.elf.Structs;
  */
 public final class StackView {
 
-    /** One 8-byte slot. label: what the kernel keeps there (null if unknown); target: where a code address points. */
-    public record Slot(long addr, long value, boolean mapped, String label, String target) {
+    /**
+     * One 8-byte slot. label: what the kernel keeps there (null if
+     * unknown); target: where a code address points; writer: for a trap
+     * frame's slot, who stored its value (CPU, vector64, alltraps), or null.
+     */
+    public record Slot(long addr, long value, boolean mapped, String label, String target, String writer,
+                       boolean stale) {
     }
 
     /** Addresses [from, to); kind "frame" or "trapframe"; step: where it was entered (-1 unknown). */
@@ -73,7 +78,8 @@ public final class StackView {
         iRbp = names.indexOf("rbp");
     }
 
-    Stack at(int step) {
+    /** writers: also find who stored each trap frame slot (a scan of the stores; Names does not need it). */
+    Stack at(int step, boolean withWriters) {
         Recording.View v = r.view(step);
         long rsp = v.regs()[iRsp];
         long rbp = v.regs()[iRbp];
@@ -108,7 +114,8 @@ public final class StackView {
         Map<Long, String> targets = new HashMap<>();
         for (int n = t.innermost(step); n >= 0 && t.kind(n) != Tree.RUN; n = t.parent(n)) {
             int o = t.origin(n);
-            if (o < 0)
+            /* a frame from before the recording: the saved-rbp chain finds it */
+            if (o < 0 || (t.flags(o) & Tree.EARLIER) != 0)
                 continue;
             int st = t.start(o);
             long e = r.registers(st)[iRsp];
@@ -134,7 +141,7 @@ public final class StackView {
                     if (Long.compareUnsigned(a, from) < 0 || labels.containsKey(a))
                         continue;
                     String name = tfFits ? tf.memberAt(a - base).name()
-                            : new String[] {"rip", "cs", "rflags", "rsp", "ss"}[(int) ((a - ripAt) / 8)];
+                            : KernelProfile.cpuFrame(-1).get((int) ((a - ripAt) / 8));
                     labels.put(a, "trapframe." + name);
                 }
                 Long rip = words.get(ripAt), cs = words.get(ripAt + 8);
@@ -184,7 +191,8 @@ public final class StackView {
                     if (Long.compareUnsigned(ret.addr(), start) < 0)
                         continue;
                     frames.add(new Frame(fn, start, ret.addr() + 8, "frame", ret.step()));
-                    fn = function(words.or0(ret.addr()), user, prog);
+                    String caller = kernel.callerOf(words.or0(ret.addr()), user, prog);
+                    fn = caller == null ? "?" : caller;
                     start = ret.addr() + 8;
                 }
                 case Trap tr -> {
@@ -205,10 +213,58 @@ public final class StackView {
         if (Long.compareUnsigned(start, area.top()) < 0)
             frames.add(new Frame(fn, start, area.top(), "frame", -1));
 
+        Map<Long, String> writers = new HashMap<>();
+        java.util.Set<Long> stale = new java.util.HashSet<>();
+        if (withWriters)
+            writers(step, marks.values(), from, writers, stale);
         List<Slot> slots = new ArrayList<>();
-        for (long a = from; Long.compareUnsigned(a, area.top()) < 0; a += 8)
-            slots.add(new Slot(a, words.or0(a), words.get(a) != null, labels.get(a), targets.get(a)));
+        for (long a = from; Long.compareUnsigned(a, area.top()) < 0; a += 8) {
+            slots.add(new Slot(a, words.or0(a), words.get(a) != null, labels.get(a), targets.get(a),
+                    writers.get(a), stale.contains(a)));
+        }
         return new Stack(step, area, rsp, rbp, slots, frames);
+    }
+
+    /** Longest stretch scanned for the stores of a trap frame's slots. */
+    private static final int MAX_WRITERS = 4 << 20;
+
+    /**
+     * For each slot of the trap frames on the stack: the function whose
+     * store wrote its value (the last store before step), or "CPU" for the
+     * words the CPU pushed while delivering the trap (stored at the step
+     * that trapped, before the stub's first step); into stale, the slots
+     * no store has written since the trap began (what they hold is older).
+     */
+    private void writers(int step, java.util.Collection<Mark> marks, long from, Map<Long, String> out,
+                         java.util.Set<Long> stale) {
+        for (Mark m : marks) {
+            if (!(m instanceof Trap tr) || tr.step() < 0 || step - tr.step() > MAX_WRITERS)
+                continue;
+            Map<Long, Long> paOf = r.virtual(step, vm -> {
+                Map<Long, Long> x = new HashMap<>();
+                for (long a = tr.base(); Long.compareUnsigned(a, tr.end()) < 0; a += 8)
+                    if (vm.pa(a) >= 0)
+                        x.put(vm.pa(a), a);
+                return x;
+            });
+            /* the stores to this frame since the trap began: scanned once, then extended */
+            Map<Long, Integer> last = new HashMap<>();
+            for (int[] w : r.trapFrameStores(tr.step(), paOf.keySet(), step))
+                if (w[0] < step)
+                    last.put(paOf.get((long) w[1] << 3), w[0]);
+            /* what the CPU pushed: from rsp at the stub's first step to the frame's end */
+            long cpu = r.registers(tr.step())[iRsp];
+            for (long a = tr.base(); Long.compareUnsigned(a, tr.end()) < 0; a += 8) {
+                if (Long.compareUnsigned(a, from) < 0)
+                    continue;
+                if (Long.compareUnsigned(a, cpu) >= 0)
+                    out.put(a, "CPU");
+                else if (last.containsKey(a))
+                    out.put(a, function(r.insn(last.get(a)).vaddr(), false, null));
+                else
+                    stale.add(a); /* left over from an earlier trap */
+            }
+        }
     }
 
     /** The stack's 8-byte words from `from`; null where unmapped or outside. */

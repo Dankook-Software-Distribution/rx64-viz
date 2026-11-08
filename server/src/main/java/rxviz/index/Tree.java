@@ -18,6 +18,9 @@ public final class Tree {
 
     public static final byte RUN = 0, FUNC = 1, INTR = 2;
     public static final byte SUSPENDED = 1, CONTINUED = 2;
+    /* found on the stack, not entered in the recording: opened before it
+     * began, or (a forked child's user frames) before the thread existed */
+    public static final byte EARLIER = 4;
 
     int n;
     int[] start = new int[1024];
@@ -28,6 +31,9 @@ public final class Tree {
     int[] thread = new int[1024];
     int[] vector = new int[1024];
     final List<String> label = new ArrayList<>();
+    /* by thread: its process slot and pid (-1: none, the scheduler) */
+    int[] threadSlot = new int[0];
+    int[] threadPid = new int[0];
 
     /* children in CSR form, built by finish() */
     private int[] childStart;
@@ -99,6 +105,31 @@ public final class Tree {
     public int vector(int i) { return vector[i]; }
     public String label(int i) { return label.get(i); }
     public int thread(int i) { return thread[i]; }
+
+    /** The process slot of thread th, or -1. */
+    public int threadSlot(int th) {
+        return th < threadSlot.length ? threadSlot[th] : -1;
+    }
+
+    /** The process slot of node i's thread, or -1 (the scheduler, boot). */
+    public int slotOf(int i) {
+        return threadSlot(thread[i]);
+    }
+
+    /** The pid of node i's thread (read when its process was first seen), or -1. */
+    public int pidOf(int i) {
+        int th = thread[i];
+        return th < threadPid.length ? threadPid[th] : -1;
+    }
+
+    /** "proc[2] pid 3": node i's process, or null when its thread is none. */
+    public String processOf(int i) {
+        int slot = slotOf(i);
+        if (slot < 0)
+            return null;
+        int pid = pidOf(i);
+        return "proc[" + slot + "]" + (pid > 0 ? " pid " + pid : "");
+    }
 
     /** Runs (roots), in start order. Do not modify. */
     int[] runs() { return roots; }

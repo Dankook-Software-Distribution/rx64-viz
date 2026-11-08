@@ -4,7 +4,7 @@
 // the cursor only expands what is new and moves the mark.
 
 import { api, type TreeNode } from "../api";
-import { cursor, stepFilter, type CursorState } from "../cursor";
+import { changesRange, cursor, showPanel, stepFilter, type CursorState } from "../cursor";
 import { shell } from "../shell";
 import { count, grouped } from "../format";
 import { el, GLYPH, note, Panel } from "./panel";
@@ -169,6 +169,19 @@ export class EventsPanel extends Panel {
     this.setExpanded(r, !r.expanded);
   }
 
+  /** The label of the run a row is in ("proc[1] init"), or null. */
+  private runOf(r: Row): string | null {
+    let e: HTMLElement | null = r.rowEl;
+    while (e && e !== this.list) {
+      if (e.classList.contains("kids")) {
+        const head = e.previousElementSibling;
+        if (head?.classList.contains("kind-run")) return head.querySelector(".label")?.textContent ?? null;
+      }
+      e = e.parentElement;
+    }
+    return null;
+  }
+
   /** Build a row (and its hidden children container) at the end of parent. */
   private row(n: TreeNode, depth: number, parent: HTMLElement): Row {
     const group = n.count > 1;
@@ -185,14 +198,26 @@ export class EventsPanel extends Panel {
       void this.toggle(r);
     };
     e.append(twisty, el("span", `glyph codicon codicon-${GLYPH[n.kind]}`));
-    let label = n.detail ?? n.label;
+    /* a run's detail (folded turns: what they waited on) goes after its label */
+    let label = n.kind === "run" ? n.label : n.detail ?? n.label;
     if (n.continued) label = "… " + label;
     if (n.suspended) label = label + " …";
     e.append(el("span", "label", label));
+    if (n.kind === "run" && n.detail) e.append(el("span", "dim run-why", ` · ${n.detail}`));
     if (group) e.append(el("span", "badge", `×${count(n.count)}`));
+    if (!group && n.kind !== "run" && n.end > n.start) {
+      const diff = el("button", "row-act codicon codicon-diff");
+      diff.title = "Show in Changes what this changed (its state at its start vs its end)";
+      diff.onclick = (ev) => {
+        ev.stopPropagation();
+        changesRange.set({ from: n.start, to: n.end, label: n.detail ?? `${n.label}()`, run: this.runOf(r) });
+        showPanel("changes");
+      };
+      e.append(diff);
+    }
     e.append(el("span", "len", count(n.end - n.start)));
     e.title =
-      `${n.kind} ${n.label}\nsteps ${grouped(n.start)} – ${grouped(n.end)}` +
+      `${n.kind} ${n.label}${n.kind === "run" && n.detail ? `\n${n.detail}` : ""}\nsteps ${grouped(n.start)} – ${grouped(n.end)}` +
       (n.continued ? "\ncontinues from before a context switch" : "") +
       (n.suspended ? "\nswitched out here; continues later" : "");
     e.onclick = () => (group ? void this.toggle(r) : void cursor.go(n.start));

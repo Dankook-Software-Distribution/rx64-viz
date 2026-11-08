@@ -13,7 +13,10 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import rxviz.config.RxvizProperties;
+import rxviz.index.CpuTables;
 import rxviz.index.MemoryImage;
+import rxviz.index.Processes;
+import rxviz.index.StateDiff;
 import rxviz.index.Recording;
 import rxviz.index.Stepper;
 import rxviz.index.Timeline;
@@ -137,7 +140,7 @@ public class RecordingController {
             }
             default -> throw new IllegalArgumentException("unknown op " + op);
         };
-        return Dto.StepDto.of(s, to);
+        return Dto.StepDto.of(r, s, to);
     }
 
     /** The next (back: previous) time the source line file:line starts to run, in any thread. */
@@ -150,7 +153,7 @@ public class RecordingController {
         /* a line with no code: its next line with code, like a breakpoint */
         int l = r.kernel().codeLineAtOrAfter(file, line);
         int to = l < 0 ? -1 : new Stepper(r).runTo(s, file, l, back);
-        return Dto.StepDto.of(s, to);
+        return Dto.StepDto.of(r, s, to);
     }
 
     /** Memory at step; space "virt" translates through CR3 at that step. */
@@ -184,6 +187,19 @@ public class RecordingController {
         return virt ? r.virtual(step, read) : r.physical(step, read);
     }
 
+    /** The running function's parameters and local variables, with their values at step. */
+    @GetMapping("/variables")
+    public rxviz.index.Variables.View variables(@PathVariable String rid, @RequestParam int step) {
+        return sessions.recording(rid).variables(step);
+    }
+
+    /** What the registers point at and the current instruction's memory operands, named. */
+    @GetMapping("/names")
+    public rxviz.index.Names.View names(@PathVariable String rid, @RequestParam int step,
+                                        @RequestParam(defaultValue = "false") boolean line) {
+        return sessions.recording(rid).names(step, line);
+    }
+
     /** The stack in use at step: its 8-byte slots from rsp to the top, and the frames on it. */
     @GetMapping("/stack")
     public Dto.StackDto stack(@PathVariable String rid, @RequestParam int step) {
@@ -192,21 +208,27 @@ public class RecordingController {
 
     /** The address space of CR3 at step: mapped virtual ranges, named. */
     @GetMapping("/regions")
-    public Dto.RegionsDto regions(@PathVariable String rid, @RequestParam int step) {
-        return Dto.RegionsDto.of(step, sessions.recording(rid).addressSpace(step));
+    public Dto.RegionsDto regions(@PathVariable String rid, @RequestParam int step,
+                                  @RequestParam(defaultValue = "-1") int slot,
+                                  @RequestParam(required = false) String root) {
+        return Dto.RegionsDto.of(step, sessions.recording(rid).addressSpace(step, root(rid, step, slot, root)));
     }
 
     /** How each 4 KB physical frame is used at step (one character per frame). */
     @GetMapping("/physmap")
-    public Dto.PhysMapDto physmap(@PathVariable String rid, @RequestParam int step) {
-        return Dto.PhysMapDto.of(step, sessions.recording(rid).physMap(step));
+    public Dto.PhysMapDto physmap(@PathVariable String rid, @RequestParam int step,
+                                  @RequestParam(defaultValue = "-1") int slot,
+                                  @RequestParam(required = false) String root) {
+        return Dto.PhysMapDto.of(step, sessions.recording(rid).physMap(step, root(rid, step, slot, root)));
     }
 
     /** One physical frame at step: its kind, where CR3 maps it, its place on the free list. */
     @GetMapping("/frame")
     public Dto.PhysFrameDto frame(@PathVariable String rid, @RequestParam int step,
-                               @RequestParam String pa) {
-        return Dto.PhysFrameDto.of(step, sessions.recording(rid).frame(step, RxvizProperties.hex(pa)));
+                               @RequestParam String pa,
+                               @RequestParam(defaultValue = "-1") int slot,
+                                  @RequestParam(required = false) String root) {
+        return Dto.PhysFrameDto.of(step, sessions.recording(rid).frame(step, RxvizProperties.hex(pa), root(rid, step, slot, root)));
     }
 
     /** [from, to) in buckets: per thread how much it ran (and in user mode), and the traps. */
@@ -218,14 +240,41 @@ public class RecordingController {
 
     @GetMapping("/pagewalk")
     public Dto.WalkDto pagewalk(@PathVariable String rid, @RequestParam int step,
-                                @RequestParam String va) {
+                                @RequestParam String va,
+                                @RequestParam(defaultValue = "-1") int slot,
+                                  @RequestParam(required = false) String root) {
         Recording r = sessions.recording(rid);
-        long cr3 = r.cr3(step);
+        long table = root(rid, step, slot, root);
+        long cr3 = table < 0 ? r.cr3(step) : table;
         long v = RxvizProperties.hex(va);
-        if (!r.paging(step)) /* addresses are physical */
-            return Dto.WalkDto.of(step, false, new MemoryImage.Walk(v, cr3, List.of(), v, 4096));
+        var soft = r.kernel().pteSoftBits();
+        if (table < 0 && !r.paging(step)) /* addresses are physical */
+            return Dto.WalkDto.of(step, false, new MemoryImage.Walk(v, cr3, List.of(), v, 4096), soft, null);
         MemoryImage.Walk w = r.memory(step, img -> img.walk(cr3, v));
-        return Dto.WalkDto.of(step, true, w);
+        return Dto.WalkDto.of(step, true, w, soft, r.tableOwner(step, cr3));
+    }
+
+    /** The page-table root a request names: slot, root (hex, physical) or neither (CR3: -1). */
+    private long root(String rid, int step, int slot, String root) {
+        return sessions.recording(rid).root(step, slot, root == null ? -1 : RxvizProperties.hex(root));
+    }
+
+    /** The CPU's GDT, TSS and IDT at step, and the lgdt / lidt that loaded them. */
+    @GetMapping("/cpu")
+    public CpuTables.View cpu(@PathVariable String rid, @RequestParam int step) {
+        return sessions.recording(rid).cpu(step);
+    }
+
+    /** The process table at step: every proc[] slot in use, and what each CPU runs. */
+    @GetMapping("/procs")
+    public Processes.View procs(@PathVariable String rid, @RequestParam int step) {
+        return sessions.recording(rid).processes(step);
+    }
+
+    /** What changed from step `from` to step `to`: processes, free frames, user mappings. */
+    @GetMapping("/diff")
+    public StateDiff.Diff diff(@PathVariable String rid, @RequestParam int from, @RequestParam int to) {
+        return sessions.recording(rid).diff(from, to);
     }
 
     /** Stores in [from, to): the first ones, or with last=N the N newest, newest first. */
@@ -235,9 +284,20 @@ public class RecordingController {
                                      @RequestParam(required = false) Integer last) {
         Recording r = sessions.recording(rid);
         int limit = last == null ? MAX_STORES : Math.min(last, MAX_STORES);
-        return r.stores(from, to, limit, last != null).stream()
-                .map(w -> new Dto.StoreDto(w.step(), Dto.hex(w.paddr()), w.size(),
-                        Dto.hex(w.value()), Dto.hex(w.old())))
-                .toList();
+        List<Recording.Store> ws = r.stores(from, to, limit, last != null);
+        /* page-table entries are named by the tables after these stores */
+        int after = Math.min(to, r.steps() - 1);
+        boolean paging = r.paging(after);
+        rxviz.index.PageTables[] pts = {null};
+        return ws.stream().map(w -> {
+            String name = rxviz.index.Names.physName(r.kernel(), w.paddr(), w.size());
+            if (name == null && paging) {
+                if (pts[0] == null)
+                    pts[0] = r.pageTables(after);
+                name = pts[0].entry(w.paddr(), false);
+            }
+            return new Dto.StoreDto(w.step(), Dto.hex(w.paddr()), w.size(),
+                    Dto.hex(w.value()), Dto.hex(w.old()), name);
+        }).toList();
     }
 }

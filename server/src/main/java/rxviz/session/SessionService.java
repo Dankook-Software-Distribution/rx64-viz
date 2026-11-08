@@ -1,5 +1,7 @@
 package rxviz.session;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -24,6 +26,9 @@ public class SessionService {
     private final Map<String, Session> sessions = new ConcurrentHashMap<>();
     private final AtomicInteger next = new AtomicInteger(1);
     private volatile Session current;
+    /* shells replaced by another: stopped, their recordings still open (newest first) */
+    private final List<Session> past = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private static final int MAX_PAST = 4;
     /* indexing is CPU and memory heavy: one at a time */
     private final ExecutorService indexer = Executors.newSingleThreadExecutor();
 
@@ -37,20 +42,35 @@ public class SessionService {
         String id = "s" + next.getAndIncrement();
         Session s = new Session(id, kernels.get(kernelId), props, indexer);
         sessions.put(id, s);
-        current = s;
         s.start();
         return s;
     }
 
     /**
      * The one shell the UI uses: stop every running guest and boot kernelId.
-     * Their recordings go with them.
+     * The UI's old shell stays readable (its recordings, in History) among
+     * the last few.
      */
     public synchronized Session replace(String kernelId) throws Exception {
         kernels.get(kernelId); /* unknown kernel: fail before stopping anything */
-        for (String id : java.util.List.copyOf(sessions.keySet()))
+        Session old = current;
+        for (String id : List.copyOf(sessions.keySet())) {
+            Session s = sessions.get(id);
             delete(id);
-        return create(kernelId);
+            if (s == old && s != null && !s.recordingList().isEmpty()) {
+                past.addFirst(s);
+                while (past.size() > MAX_PAST)
+                    past.removeLast();
+            }
+        }
+        Session s = create(kernelId); /* create() alone (a test's guest) never becomes the UI's shell */
+        current = s;
+        return s;
+    }
+
+    /** Shells the UI replaced, newest first: their guests are stopped, their recordings still open. */
+    public List<Session> past() {
+        return new ArrayList<>(past);
     }
 
     /** The newest running guest, or null. */
@@ -84,7 +104,15 @@ public class SessionService {
         int dash = recId.lastIndexOf('-');
         if (dash < 0)
             throw new NotFoundException("no recording " + recId);
-        Session.Rec r = get(recId.substring(0, dash)).recording(recId);
+        String sid = recId.substring(0, dash);
+        Session owner = sessions.get(sid);
+        if (owner == null)
+            for (Session p : past)
+                if (p.id().equals(sid))
+                    owner = p;
+        if (owner == null)
+            throw new NotFoundException("no session " + sid);
+        Session.Rec r = owner.recording(recId);
         if (r == null)
             throw new NotFoundException("no recording " + recId);
         if (r.recording == null)

@@ -15,7 +15,8 @@ import com.github.luben.zstd.ZstdInputStream;
 public final class MemoryImage {
 
     public static final long ADDR_MASK = 0x000ffffffffff000L;
-    private static final String[] LEVEL = {"PML4", "PDPT", "PD", "PT"};
+    /** Page-table levels by depth (0: the root). */
+    static final String[] LEVEL = {"PML4", "PDPT", "PD", "PT"};
 
     private final byte[] mem;
 
@@ -112,8 +113,9 @@ public final class MemoryImage {
     public interface Mappings {
         void table(long pa, int level);
 
+        /** entryAddr: physical address of the leaf entry (the PTE). */
         void leaf(long va, long pa, long size, boolean writable, boolean user, boolean noExecute,
-                  long entry);
+                  long entry, long entryAddr);
     }
 
     /**
@@ -122,16 +124,21 @@ public final class MemoryImage {
      * (NX: if any level sets it), as the MMU checks them.
      */
     public void enumerate(long cr3, Mappings out) {
-        enumerate(cr3 & ADDR_MASK, 0, 0, true, true, false, out);
+        enumerate(cr3 & ADDR_MASK, 0, 0, true, true, false, 512, out);
+    }
+
+    /** Like enumerate(), for the lower (user) half only: PML4 entries 0-255. */
+    public void enumerateLower(long cr3, Mappings out) {
+        enumerate(cr3 & ADDR_MASK, 0, 0, true, true, false, 256, out);
     }
 
     private void enumerate(long table, int level, long base, boolean w, boolean u, boolean nx,
-                           Mappings out) {
+                           int entries, Mappings out) {
         if (!contains(table, 4096))
             return;
         out.table(table, level);
         int shift = 39 - 9 * level;
-        for (int i = 0; i < 512; i++) {
+        for (int i = 0; i < entries; i++) {
             long e = read(table + 8L * i, 8);
             if ((e & 1) == 0)
                 continue;
@@ -141,9 +148,9 @@ public final class MemoryImage {
             boolean w2 = w && (e & 2) != 0, u2 = u && (e & 4) != 0, nx2 = nx || e < 0;
             if (level == 3 || (level > 0 && (e & 0x80) != 0)) {
                 long size = 1L << shift;
-                out.leaf(va, (e & ADDR_MASK) & ~(size - 1), size, w2, u2, nx2, e);
+                out.leaf(va, (e & ADDR_MASK) & ~(size - 1), size, w2, u2, nx2, e, table + 8L * i);
             } else {
-                enumerate(e & ADDR_MASK, level + 1, va, w2, u2, nx2, out);
+                enumerate(e & ADDR_MASK, level + 1, va, w2, u2, nx2, 512, out);
             }
         }
     }

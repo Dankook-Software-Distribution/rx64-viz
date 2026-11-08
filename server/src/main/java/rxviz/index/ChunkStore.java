@@ -130,6 +130,11 @@ public final class ChunkStore implements AutoCloseable {
             }
         }
 
+        /** The registers the instruction before step wrote, as a bit per register (step in this chunk). */
+        public int written(int step) {
+            return mask[step - base];
+        }
+
         /** Every register at step (which must be in this chunk). */
         public long[] registers(int step) {
             long[] r = head.clone();

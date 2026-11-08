@@ -67,25 +67,40 @@ public final class Dto {
         }
     }
 
-    /** detail: for a syscall or exception, its one-line form (write(1, "hi", 2) = 2). */
+    /**
+     * detail: for a syscall or exception, its one-line form (write(1,
+     * "hi", 2) = 2). entered: where the frame really began (for a
+     * continued one, in an earlier run; null if not found); earlier: it
+     * began before the recording.
+     */
     public record NodeDto(int id, String kind, String label, int start, int end,
                           int children, boolean continued, boolean suspended,
-                          Integer vector, int count, List<Integer> members, String detail) {
+                          Integer vector, int count, List<Integer> members, String detail,
+                          Integer entered, boolean earlier) {
         NodeDto withDetail(Recording r) {
+            if (kind.equals("run") && count > 1 && members != null)
+                return new NodeDto(id, kind, label, start, end, children, continued, suspended,
+                        vector, count, members, r.turnsDetail(members), entered, earlier);
             if (!kind.equals("trap") || count != 1)
                 return this;
             return new NodeDto(id, kind, label, start, end, children, continued, suspended,
-                    vector, count, members, r.trapDetail(id));
+                    vector, count, members, r.trapDetail(id), entered, earlier);
         }
     }
 
     public record SyscallDto(int step, int end, boolean returned, Integer resumeStep,
-                             String process, String kind, String name, String text,
-                             String result, String output, int node) {
+                             String process, Integer slot, Integer pid, String program, String kind,
+                             String name, String text,
+                             String result, String output, int node, Integer handlerStep,
+                             String handler, boolean earlier, Syscalls.Wait waited,
+                             List<Syscalls.Wait> waits, String resumesAt) {
         static SyscallDto of(Syscalls.Call c) {
             return new SyscallDto(c.step(), c.end(), c.returned(),
-                    c.resumeStep() < 0 ? null : c.resumeStep(), c.process(), c.kind(), c.name(),
-                    c.text(), c.result(), c.output(), c.node());
+                    c.resumeStep() < 0 ? null : c.resumeStep(), c.process(),
+                    c.slot() < 0 ? null : c.slot(), c.pid() > 0 ? c.pid() : null, c.program(), c.kind(), c.name(),
+                    c.text(), c.result(), c.output(), c.node(),
+                    c.handlerStep() < 0 ? null : c.handlerStep(), c.handler(), c.earlier(),
+                    c.waited(), c.waits(), c.resumesAt());
         }
     }
 
@@ -108,7 +123,15 @@ public final class Dto {
                 hide == null ? t.childCount(i) : visible(t, i, hide).length,
                 (t.flags(i) & Tree.CONTINUED) != 0,
                 (t.flags(i) & Tree.SUSPENDED) != 0,
-                t.vector(i) >= 0 ? t.vector(i) : null, 1, null, null);
+                t.vector(i) >= 0 ? t.vector(i) : null, 1, null, null, entered(t, i),
+                (t.flags(i) & Tree.EARLIER) != 0);
+    }
+
+    private static Integer entered(Tree t, int i) {
+        if ((t.flags(i) & Tree.CONTINUED) == 0)
+            return t.start(i);
+        int o = t.origin(i);
+        return o < 0 ? null : t.start(o);
     }
 
     private static final int MAX_PERIOD = 4;
@@ -156,7 +179,8 @@ public final class Dto {
             for (int k = i; k < i + bestP; k++)
                 lab.append(k > i ? ", " : "").append(t.label(kids[k]));
             out.add(new NodeDto(kids[i], runs ? "run" : "call", lab.toString(), t.start(kids[i]),
-                    t.end(kids[j - 1]), nkids, false, false, null, bestR, members, null));
+                    t.end(kids[j - 1]), nkids, false, false, null, bestR, members, null,
+                    t.start(kids[i]), false));
             i = j;
         }
         return out;
@@ -209,8 +233,15 @@ public final class Dto {
         }
     }
 
+    /**
+     * mode: the CPU's mode at the step (real, protected 32-bit,
+     * compatibility, 64-bit); changed: registers the instruction just
+     * before the step wrote; slot, pid: the process of the thread running
+     * (null: the scheduler, boot).
+     */
     public record StateDto(int step, String pc, int cpl, LocationDto location,
-                           Map<String, String> registers, List<NodeDto> path) {
+                           Map<String, String> registers, List<NodeDto> path, String mode,
+                           List<String> changed, Integer slot, Integer pid) {
         static StateDto of(Recording r, int step) {
             Recording.View v = r.view(step);
             Map<String, String> m = new LinkedHashMap<>();
@@ -220,8 +251,11 @@ public final class Dto {
             List<NodeDto> path = new ArrayList<>();
             for (int n = t.innermost(step); n >= 0; n = t.parent(n))
                 path.addFirst(node(t, n).withDetail(r));
+            int root = t.rootAt(step);
+            int slot = root < 0 ? -1 : t.slotOf(root), pid = root < 0 ? -1 : t.pidOf(root);
             return new StateDto(step, hex(v.insn().vaddr()), v.cpl(),
-                    LocationDto.of(v.location()), m, path);
+                    LocationDto.of(v.location()), m, path, r.cpuMode(v), r.written(step),
+                    slot < 0 ? null : slot, pid < 0 ? null : pid);
         }
     }
 
@@ -241,20 +275,28 @@ public final class Dto {
         }
     }
 
-    /** paging: false while CR0.PG is off (then pa = va and there are no levels). */
+    /**
+     * paging: false while CR0.PG is off (then pa = va and there are no
+     * levels); softBits: entry bits 9-11 the kernel names (riscv-style's
+     * PTE_R, PTE_X); table: whose table was walked.
+     */
     public record WalkDto(int step, boolean paging, String va, String cr3, List<LevelDto> levels,
-                          String pa, long pageSize) {
-        static WalkDto of(int step, boolean paging, MemoryImage.Walk w) {
+                          String pa, long pageSize, List<KernelProfile.SoftBit> softBits, String table) {
+        static WalkDto of(int step, boolean paging, MemoryImage.Walk w, List<KernelProfile.SoftBit> soft,
+                          String table) {
             return new WalkDto(step, paging, hex(w.va()), hex(w.cr3()),
                     w.levels().stream().map(LevelDto::of).toList(),
-                    w.pa() < 0 ? null : hex(w.pa()), w.pageSize());
+                    w.pa() < 0 ? null : hex(w.pa()), w.pageSize(), soft, table);
         }
     }
 
-    public record StoreDto(int step, String pa, int size, String value, String old) {
+    /** name: what the address is in the kernel image (proc[2].state), or null. */
+    public record StoreDto(int step, String pa, int size, String value, String old, String name) {
     }
 
-    public record SlotDto(String addr, String value, boolean mapped, String label, String target) {
+    /** stale: a trap-frame slot nothing stored since the trap began (it holds an older value). */
+    public record SlotDto(String addr, String value, boolean mapped, String label, String target,
+                          String writer, boolean stale) {
     }
 
     public record FrameDto(String function, String from, String to, String kind, Integer step) {
@@ -266,7 +308,7 @@ public final class Dto {
             return new StackDto(s.step(), s.area().kind(), s.area().label(),
                     hex(s.area().base()), hex(s.area().top()), hex(s.rsp()), hex(s.rbp()),
                     s.slots().stream().map(x -> new SlotDto(hex(x.addr()), hex(x.value()),
-                            x.mapped(), x.label(), x.target())).toList(),
+                            x.mapped(), x.label(), x.target(), x.writer(), x.stale())).toList(),
                     s.frames().stream().map(f -> new FrameDto(f.function(), hex(f.from()),
                             hex(f.to()), f.kind(), f.step() < 0 ? null : f.step())).toList());
         }
@@ -277,13 +319,16 @@ public final class Dto {
                             long pageSize, int pages) {
     }
 
+    /** pa: null for a range with no frame (below p->sz, not mapped); sz: p->sz (null if not a process's). */
     public record RegionsDto(int step, boolean paging, String cr3, String program, int tables,
-                             List<RegionDto> regions) {
+                             int userTables, String sz, List<RegionDto> regions) {
         static RegionsDto of(int step, AddressSpace.Layout m) {
             return new RegionsDto(step, m.paging(), hex(m.cr3()), m.program(), m.tables(),
+                    m.userTables(), m.sz() < 0 ? null : hex(m.sz()),
                     m.regions().stream().map(g -> new RegionDto(hex(g.va()), hex(g.end()),
                             g.kind(), g.label(), g.writable(), g.user(), g.executable(),
-                            hex(g.pa()), g.contiguous(), g.pageSize(), g.pages())).toList());
+                            g.pa() < 0 ? null : hex(g.pa()), g.contiguous(), g.pageSize(),
+                            g.pages())).toList());
         }
     }
 
@@ -305,11 +350,21 @@ public final class Dto {
         }
     }
 
-    /** found: false if the move had nowhere to go (not in a loop, line not run); step is then from. */
-    public record StepDto(int step, boolean found) {
+    /**
+     * found: false if the move had nowhere to go (not in a loop, line not
+     * run); step is then from. ran: other threads that ran between from
+     * and step (a move over a sleep or a switch), in order.
+     */
+    public record StepDto(int step, boolean found, List<String> ran) {
         /** to < 0: there was nowhere to go from `from`. */
         static StepDto of(int from, int to) {
-            return to < 0 ? new StepDto(from, false) : new StepDto(to, true);
+            return to < 0 ? new StepDto(from, false, List.of()) : new StepDto(to, true, List.of());
+        }
+
+        static StepDto of(Recording r, int from, int to) {
+            if (to < 0)
+                return of(from, to);
+            return new StepDto(to, true, r.othersBetween(from, to));
         }
     }
 

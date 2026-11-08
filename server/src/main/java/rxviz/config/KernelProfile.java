@@ -39,8 +39,8 @@ public final class KernelProfile {
         }
     }
 
-    /** An executable image: the kernel or a user program. */
-    public record Program(ElfFile elf, Disassembly disas, LineTable lines) {
+    /** An executable image: the kernel or a user program; code32: its ranges assembled for 32-bit mode (.code32). */
+    public record Program(ElfFile elf, Disassembly disas, LineTable lines, List<long[]> code32) {
         public String name() {
             return elf.name();
         }
@@ -48,7 +48,12 @@ public final class KernelProfile {
         static Program load(String name, Path file, LineTable.SourceTree src) {
             try {
                 ElfFile elf = ElfFile.load(name, file);
-                return new Program(elf, Disassembly.of(elf), LineTable.of(elf, src));
+                Disassembly d = Disassembly.of(elf);
+                LineTable lines = LineTable.of(elf, src);
+                List<long[]> c32 = lines.code32(src);
+                for (long[] r : c32)
+                    d.as32(elf, r[0], r[1]);
+                return new Program(elf, d, lines, c32);
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
@@ -70,8 +75,14 @@ public final class KernelProfile {
     public record StackArea(String kind, String label, long base, long top) {
     }
 
-    /** A named range of kernel virtual addresses (see what()). */
-    public record Region(long va, long size, String kind, String label) {
+    /**
+     * A named range of kernel virtual addresses (see what()); pa: where va
+     * is meant to map (a device's registers), or -1 if that is not fixed.
+     */
+    public record Region(long va, long size, String kind, String label, long pa) {
+        public Region(long va, long size, String kind, String label) {
+            this(va, size, kind, label, -1);
+        }
     }
 
     /**
@@ -172,7 +183,7 @@ public final class KernelProfile {
         if (k.regions() != null)
             for (RxvizProperties.Region g : k.regions())
                 regions.add(new Region(RxvizProperties.hex(g.va()), RxvizProperties.hex(g.size()),
-                        g.kind(), g.label()));
+                        g.kind(), g.label(), g.pa() == null ? -1 : RxvizProperties.hex(g.pa())));
         String entry = k.bootEntry() == null ? "_entry" : k.bootEntry();
         long entryVa = kernel.elf().addressOf(entry);
         this.bootEntry = entryVa == -1 ? -1 : kernel.elf().physOf(entryVa);
@@ -336,6 +347,16 @@ public final class KernelProfile {
     }
 
     /** x86 exceptions for which the CPU pushes an error code (architectural). */
+    /** What the CPU pushes for an interrupt or exception, lowest address first: [error code,] rip, cs, rflags, rsp, ss. */
+    public static List<String> cpuFrame(int vector) {
+        List<String> f = List.of("rip", "cs", "rflags", "rsp", "ss");
+        if (!hasErrorCode(vector))
+            return f;
+        List<String> e = new ArrayList<>(f);
+        e.addFirst("error code");
+        return e;
+    }
+
     public static boolean hasErrorCode(int vector) {
         return switch (vector) {
             case 8, 10, 11, 12, 13, 14, 17, 21, 29, 30 -> true;
@@ -359,6 +380,132 @@ public final class KernelProfile {
     public TrapKind trapKind(int vector) {
         return vector == syscallVector ? TrapKind.SYSCALL
                 : vector >= 0 && vector < 32 ? TrapKind.EXCEPTION : TrapKind.INTERRUPT;
+    }
+
+    private Map<String, Long> defines;
+
+    /** A page-table-entry bit the MMU ignores that the kernel names (PTE_R, bit 9), with its comment. */
+    public record SoftBit(int bit, String name, String what) {
+    }
+
+    private List<SoftBit> softBits;
+
+    /**
+     * The bits 9-11 of a page-table entry (ignored by the MMU, free for
+     * software) the kernel #defines as PTE_ flags: riscv-style keeps
+     * RISC-V's R and X there.
+     */
+    public synchronized List<SoftBit> pteSoftBits() {
+        if (softBits != null)
+            return softBits;
+        List<SoftBit> out = new ArrayList<>();
+        java.util.regex.Pattern def = java.util.regex.Pattern.compile(
+                "^#define\\s+(PTE_[A-Z0-9_]+)\\s+\\(1U?L?L?\\s*<<\\s*(\\d+)\\)\\s*(?://\\s*(.*))?$");
+        for (String line : headerLines()) {
+            java.util.regex.Matcher m = def.matcher(line.trim());
+            int bit = m.matches() ? Integer.parseInt(m.group(2)) : -1;
+            if (bit >= 9 && bit <= 11 && out.stream().noneMatch(b -> b.bit() == bit))
+                out.add(new SoftBit(bit, m.group(1), m.group(3) == null ? "" : m.group(3).trim()));
+        }
+        return softBits = List.copyOf(out);
+    }
+
+    /**
+     * Numeric #defines of the kernel's headers (SBRK_LAZY 2, O_CREATE
+     * 0x200, ...), read once from kernel/**.h: the names the kernel's own
+     * code gives to argument values.
+     */
+    public synchronized Map<String, Long> defines() {
+        if (defines != null)
+            return defines;
+        Map<String, Long> out = new java.util.LinkedHashMap<>();
+        java.util.regex.Pattern def = java.util.regex.Pattern.compile(
+                "^#define\\s+([A-Z][A-Z0-9_]*)\\s+\\(?(0x[0-9a-fA-F]+|\\d+)\\)?\\s*(?:/[/*].*)?$");
+        for (String line : headerLines()) {
+            java.util.regex.Matcher m = def.matcher(line.trim());
+            if (!m.matches())
+                continue;
+            String v = m.group(2);
+            try {
+                out.putIfAbsent(m.group(1), v.startsWith("0x")
+                        ? Long.parseUnsignedLong(v.substring(2), 16) : Long.parseLong(v));
+            } catch (NumberFormatException e) {
+                /* wider than 64 bits: not a flag value */
+            }
+        }
+        return defines = out;
+    }
+
+    private List<String> headerLines;
+
+    /** Every line of the kernel's headers (kernel/**.h, in path order), read once; none if unreadable. */
+    private synchronized List<String> headerLines() {
+        if (headerLines != null)
+            return headerLines;
+        List<String> out = new ArrayList<>();
+        try (Stream<Path> files = Files.walk(dir.resolve("kernel"))) {
+            for (Path f : files.filter(x -> x.toString().endsWith(".h")).sorted().toList())
+                out.addAll(Files.readAllLines(f));
+        } catch (IOException e) {
+            /* no names then */
+        }
+        return headerLines = out;
+    }
+
+    /**
+     * True if the kernel code at pc is 32-bit (its .code32 entry code): the
+     * CPU runs it in protected or compatibility mode, whatever EFER says.
+     */
+    public boolean isCode32(long pc) {
+        Resolved r = resolve(pc, false, null);
+        if (r == null || r.image() != kernel)
+            return false;
+        for (long[] c : kernel.code32())
+            if (Long.compareUnsigned(r.linked(), c[0]) >= 0 && Long.compareUnsigned(r.linked(), c[1]) < 0)
+                return true;
+        return false;
+    }
+
+    private final Map<Program, rxviz.elf.Locals> locals = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** The parameters and local variables of a program's functions (read on first use). */
+    public rxviz.elf.Locals locals(Program p) {
+        return locals.computeIfAbsent(p, x -> {
+            try {
+                return rxviz.elf.Locals.of(x.elf());
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        });
+    }
+
+    /** True if pc is compiled C in the kernel (a .c file, or a function inlined from a header), not assembly. */
+    public boolean isC(long pc) {
+        LineTable.Src src = source(pc, false, null);
+        return src != null && !src.file().endsWith(".S");
+    }
+
+    /** A user program by name, or null. */
+    public Program program(String name) {
+        for (Program p : programs)
+            if (p.name().equals(name))
+                return p;
+        return null;
+    }
+
+    /** The address pc is linked at in its image (aliases, the boot's physical entry resolved), or pc. */
+    public long linked(long pc, boolean user, Program program) {
+        Resolved r = resolve(pc, user, program);
+        return r == null ? pc : r.linked();
+    }
+
+    /** The kernel image as a Program. */
+    public Program kernelProgram() {
+        return kernel;
+    }
+
+    public int syscallVector() {
+        return syscallVector;
     }
 
     public boolean isSyscallVector(int vector) {
@@ -446,7 +593,7 @@ public final class KernelProfile {
         ElfFile.Symbol s = r.image().elf().symbolAt(a);
         LineTable.Src src = r.image().lines().at(a);
         return new Location(r.image().name(), s == null ? null : s.name(),
-                s == null ? 0 : a - s.addr(), r.image().disas().at(a),
+                s == null ? 0 : a - s.addr(), user ? r.image().disas().at(a) : relocated(pc, r.image().disas().at(a)),
                 src == null ? null : src.file(), src == null ? 0 : src.line());
     }
 
@@ -457,6 +604,16 @@ public final class KernelProfile {
     }
 
     /** Function symbol at pc, or null. */
+    /**
+     * The function that called with return address ret: the one holding
+     * the call (ret - 1). A call that never returns may be its function's
+     * last instruction (main's call scheduler), so ret itself can be in the
+     * next symbol.
+     */
+    public String callerOf(long ret, boolean user, Program program) {
+        return ret == 0 ? null : function(ret - 1, user, program);
+    }
+
     public String function(long pc, boolean user, Program program) {
         Resolved r = resolve(pc, user, program);
         ElfFile.Symbol s = r == null ? null : r.image().elf().symbolAt(r.linked());
@@ -500,9 +657,36 @@ public final class KernelProfile {
         for (var e : r.image().disas().around(r.linked(), before, after)) {
             ElfFile.Symbol s = elf.symbolAt(e.getKey());
             String fn = s != null && s.addr() == e.getKey() ? s.name() : null;
-            out.add(new Line(e.getKey() + delta, e.getValue(), fn));
+            out.add(new Line(e.getKey() + delta, relocated(pc, e.getValue()), fn));
         }
         return out;
+    }
+
+    private static final Pattern TARGET = Pattern.compile("\\b([0-9a-f]{4,16}) <");
+
+    /**
+     * Code that runs at an alias (riscv-style's trampoline at TRAMPOLINE):
+     * objdump writes direct jump targets at the linked addresses; the CPU
+     * jumps to the same place in the alias.
+     */
+    private String relocated(long pc, String text) {
+        if (text == null)
+            return null;
+        for (Alias al : aliases) {
+            if (!Addr.in(pc, al.va, al.size))
+                continue;
+            Matcher m = TARGET.matcher(text);
+            StringBuilder b = new StringBuilder();
+            while (m.find()) {
+                long t = Long.parseUnsignedLong(m.group(1), 16);
+                String rep = Addr.in(t, al.target, al.size)
+                        ? Long.toHexString(al.va + (t - al.target)) + " <" : m.group();
+                m.appendReplacement(b, Matcher.quoteReplacement(rep));
+            }
+            m.appendTail(b);
+            return b.toString();
+        }
+        return text;
     }
 
     /**
@@ -526,7 +710,7 @@ public final class KernelProfile {
         for (var e : r.image().disas().between(fn.addr(), elf.symbolEnd(fn.addr()))) {
             LineTable.Src src = lines.at(e.getKey());
             if (src != null && src.line() == want && src.file().equals(here.file()))
-                out.add(new Line(e.getKey() + delta, e.getValue(), null));
+                out.add(new Line(e.getKey() + delta, relocated(pc, e.getValue()), null));
         }
         return out;
     }

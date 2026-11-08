@@ -67,6 +67,12 @@ public class SessionController {
         return s == null ? null : Dto.SessionDto.of(s);
     }
 
+    /** Shells replaced earlier (newest first): their recordings can still be opened. */
+    @GetMapping("/shell/past")
+    public List<Dto.SessionDto> pastShells() {
+        return sessions.past().stream().map(Dto.SessionDto::of).toList();
+    }
+
     /** Boot a fresh shell on a kernel, replacing the current one. */
     @PostMapping("/shell")
     public Dto.SessionDto newShell(@RequestBody CreateRequest req) throws Exception {

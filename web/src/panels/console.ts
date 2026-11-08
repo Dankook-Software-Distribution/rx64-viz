@@ -84,6 +84,9 @@ export class ConsolePanel extends Panel {
     ws.onclose = () => {
       if (this.ws === ws) setHead("STOPPED");
     };
+    /* F10 / F11 step the recording (chrome.ts), even with the console
+     * focused: never send their escape sequences to the guest's shell */
+    term.attachCustomKeyEventHandler((e) => e.key !== "F10" && e.key !== "F11");
     term.onData((data) => {
       if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "input", data }));
     });

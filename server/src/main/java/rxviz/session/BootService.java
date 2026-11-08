@@ -92,6 +92,7 @@ public class BootService {
             b.status = Status.INDEXING;
             b.recording = Indexer.index(recordingId(k.id()), "boot", k,
                     SegmentFiles.of(dir, 0), (int) props.physMemBytes());
+            Recording.registerBoot(b.recording);
             b.status = Status.READY;
             log.info("boot {}: indexed, {} steps in {} ms", k.id(), b.recording.steps(),
                     b.recording.summary().indexMillis());

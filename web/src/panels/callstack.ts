@@ -28,9 +28,13 @@ export class CallStackPanel extends Panel {
       const r = el("button", `frame kind-${n.kind}` + (i === 0 ? " current" : ""));
       r.append(el("span", `glyph codicon codicon-${i === 0 ? "debug-stackframe" : GLYPH[n.kind]}`));
       r.append(el("span", "label", n.detail ?? n.label));
-      r.append(el("span", "len", `step ${grouped(n.start)}`));
-      r.title = `Go to the start of ${n.detail ?? n.label}`;
-      r.onclick = () => void cursor.go(n.start);
+      /* where the frame began: a continued frame began in an earlier run */
+      const at = n.earlier ? null : n.entered ?? n.start;
+      r.append(el("span", "len", at === null ? "before the recording" : `step ${grouped(at)}`));
+      r.title = at === null
+        ? `${n.detail ?? n.label} began before the recording (found on the stack); click: its first step here`
+        : `Go to the start of ${n.detail ?? n.label}`;
+      r.onclick = () => void cursor.go(at ?? n.start);
       frag.append(r);
     });
     if (!path.length) frag.append(note("No frame contains this step."));

@@ -2,10 +2,11 @@
 // walk from CR3 to the frame of one virtual address, and what every
 // physical frame is used for, side by side. The virtual address can
 // follow a register (rip, rsp, cr2) or be typed in; the frame follows
-// the walk unless one is picked on the grid.
+// the walk unless one is picked on the grid. Processes can point it at
+// another process's page table instead of CR3's (memorySpace).
 
-import { api, type FrameKind, type Memory, type PhysFrame, type PhysMap, type Region, type Regions, type Walk } from "../api";
-import { cursor, type CursorState } from "../cursor";
+import { api, type FrameKind, type Memory, type PhysFrame, type PhysMap, type Region, type Regions, type SoftBit, type Space, type State, type Walk } from "../api";
+import { cursor, memorySpace, memoryTarget, type CursorState } from "../cursor";
 import { grouped, hex } from "../format";
 import { cssVar, el, note, Panel, placeholder, sizeCanvas } from "./panel";
 
@@ -15,7 +16,7 @@ const KIND_NAMES: Record<FrameKind, string> = {
   s: "kernel stacks",
   x: "other kernel pages mapped here",
   k: "kernel image",
-  o: "allocated, not mapped here",
+  o: "not free, not mapped here (in use elsewhere, or not given to kalloc yet)",
   f: "free (kmem.freelist)",
   l: "low memory (firmware, boot)",
 };
@@ -66,8 +67,12 @@ export class MemoryPanel extends Panel {
   private walkCol = el("div", "mem-col");
   private physCol = el("div", "mem-col");
   private cols = el("div", "memory-cols");
+  /** says whose address space is shown when it is not CR3's */
+  private spaceBar = el("div", "mem-space");
 
   private follow: Follow = "rip";
+  /** the user picked what to follow (else a page fault follows cr2 on its own) */
+  private pickedFollow = false;
   private va: bigint | null = null;
   /** frame picked on the grid (null: the walk's frame) */
   private picked: bigint | null = null;
@@ -85,6 +90,9 @@ export class MemoryPanel extends Panel {
   } | null = null;
 
   private canvas = el("canvas", "phys-grid");
+  /** the frames around the one shown, magnified */
+  private zoom = el("canvas", "phys-zoom");
+  private zoomGeom = { first: 0, cols: 64, cell: 8 };
   private hoverLine = el("div", "phys-hover");
   private geom = { cols: 128, cell: 3, gutter: 0 };
 
@@ -94,14 +102,45 @@ export class MemoryPanel extends Panel {
 
   protected mount() {
     this.cols.append(this.vaCol, this.walkCol, this.physCol);
-    this.element.append(this.cols);
+    this.element.append(this.spaceBar, this.cols);
     this.onDispose(cursor.subscribe((c) => void this.update(c)));
+    this.onDispose(memorySpace.subscribe((sp) => {
+      this.spaceBar.replaceChildren();
+      this.spaceBar.hidden = sp === null;
+      if (sp) {
+        this.spaceBar.append(el("span", "codicon codicon-layers"),
+          el("span", "", sp.root !== undefined
+            ? ` The page table at ${sp.root} (${sp.name}), not necessarily the one in CR3`
+            : ` Address space of proc[${sp.slot}] ${sp.name}: its own page table (p->pagetable), not necessarily the one in CR3`));
+        const back = el("button", "link", "Show CR3's");
+        back.onclick = () => memorySpace.set(null);
+        this.spaceBar.append(document.createTextNode(" · "), back);
+      }
+      this.picked = null;
+      /* another process's space: start at its user memory, not the CPU's rip */
+      if (sp) {
+        this.follow = null;
+        this.va = 0n;
+      } else this.follow = "rip";
+      void this.update(cursor.value);
+    }));
     this.onResize(() => {
       if (!this.visible()) return;
       if (this.dirty) void this.update(cursor.value);
       else this.draw();
     });
     this.onTheme(() => this.draw());
+    this.onDispose(memoryTarget.subscribe((t) => {
+      if (!t) return;
+      this.pickedFollow = true;
+      this.select({ follow: null, va: BigInt(t.va), picked: null });
+    }));
+    this.zoom.onmousemove = (ev) => this.zoomHover(ev);
+    this.zoom.onmouseleave = () => (this.hoverLine.textContent = "");
+    this.zoom.onclick = (ev) => {
+      const i = this.zoomCell(ev);
+      if (i !== null) this.select({ picked: BigInt(i) * 4096n });
+    };
     this.canvas.onmousemove = (ev) => this.hover(ev);
     this.canvas.onmouseleave = () => (this.hoverLine.textContent = "");
     this.canvas.onclick = (ev) => {
@@ -109,6 +148,25 @@ export class MemoryPanel extends Panel {
       if (i === null) return;
       this.select({ picked: BigInt(i) * 4096n });
     };
+  }
+
+  /** What the walk follows: inside a page fault, the address that faulted, unless the user chose. */
+  private shownFollow(s: { path: { kind: string; vector: number | null }[] }): Follow {
+    const inFault = s.path.some((n) => n.kind === "trap" && n.vector === 14);
+    return this.follow === "rip" && !this.pickedFollow && inFault ? "cr2" : this.follow;
+  }
+
+  /**
+   * Whose page table to show: the one picked (memorySpace); while
+   * following a user page fault, the faulting process's own table
+   * (riscv-style handles faults with the kernel's table in CR3, where
+   * cr2 is not mapped); else CR3's.
+   */
+  private space(s: State, follow: Follow): Space {
+    const sp = memorySpace.value;
+    if (sp) return sp.root !== undefined ? { root: sp.root } : { slot: sp.slot };
+    if (follow === "cr2" && s.slot !== null && BigInt(s.registers.cr2 ?? "0") < 1n << 47n) return { slot: s.slot };
+    return {};
   }
 
   /** Change what is shown (the address to walk, a picked frame) and redraw. */
@@ -134,18 +192,20 @@ export class MemoryPanel extends Panel {
     this.dirty = false;
     const signal = this.fresh();
     const rid = c.rec.id;
-    const va = this.follow ? BigInt(s.registers[this.follow] ?? s.pc) : this.va ?? BigInt(s.pc);
+    const follow = this.shownFollow(s);
+    const va = follow ? BigInt(follow === "rip" ? s.pc : s.registers[follow] ?? s.pc) : this.va ?? BigInt(s.pc);
     const vaHex = hex(va);
+    const space = this.space(s, follow);
     try {
       const [regions, phys, walk] = await Promise.all([
-        api.regions(rid, s.step, signal),
-        api.physmap(rid, s.step, signal),
-        api.pagewalk(rid, s.step, vaHex, signal),
+        api.regions(rid, s.step, signal, space),
+        api.physmap(rid, s.step, signal, space),
+        api.pagewalk(rid, s.step, vaHex, signal, space),
       ]);
       const framePa = this.picked ?? (walk.pa ? BigInt(walk.pa) & ~0xfffn : null);
       const [frame, dump] = framePa !== null && framePa < BigInt(phys.frames.length) * 4096n
         ? await Promise.all([
-            api.frame(rid, s.step, hex(framePa), signal),
+            api.frame(rid, s.step, hex(framePa), signal, space),
             api.memory(rid, s.step, hex(framePa), 4096, "phys", signal),
           ])
         : [null, null];
@@ -184,7 +244,10 @@ export class MemoryPanel extends Panel {
   private renderRegions(m: Regions, va: bigint, prev: MemoryPanel["last"]) {
     const s = this.data!.c.state!;
     const head = colHead("Virtual address space",
-      `cr3 ${hex(m.cr3)} · ${m.program ?? "no user program"} · ${m.tables} page-table pages`);
+      `${this.data?.walk.table ? `${this.data.walk.table}'s page table` : memorySpace.value ? "page table" : "cr3"} ${hex(m.cr3)} · ${m.program ?? "no user program"}`
+      + (m.sz ? ` · p->sz ${hex(m.sz)} (${bytes(BigInt(m.sz))})` : "")
+      + ` · ${m.tables} page-table pages`
+      + (m.tables > m.userTables ? ` (${m.userTables} for the user half, ${m.tables - m.userTables} for the kernel half, shared by every process)` : ""));
     const pick = el("div", "va-pick");
     const input = el("input", "va-input");
     input.value = hex(va);
@@ -197,15 +260,17 @@ export class MemoryPanel extends Panel {
       } catch {
         return;
       }
+      this.pickedFollow = true;
       this.select({ follow: null, va: this.va, picked: null });
     };
     pick.append(input);
     for (const r of ["rip", "rsp", "cr2"] as const) {
       const v = r === "rip" ? s.pc : s.registers[r];
       if (!v) continue;
-      const chip = el("button", "chip" + (this.follow === r ? " on" : ""), r);
-      chip.title = `Follow ${r} (${hex(v)})`;
+      const chip = el("button", "chip" + (this.shownFollow(s) === r ? " on" : ""), r);
+      chip.title = `Follow ${r} (${hex(v)})` + (r === "cr2" ? "; inside a page fault this is the default" : "");
       chip.onclick = () => {
+        this.pickedFollow = true;
         this.select({ follow: r, picked: null });
       };
       pick.append(chip);
@@ -266,18 +331,24 @@ export class MemoryPanel extends Panel {
     const a = BigInt(g.va), e = BigInt(g.end);
     const sel = va >= a && va < e;
     const changed = prev !== null && !prev.regions.has(regionKey(g));
-    const r = el("button", "region" + (sel ? " selected" : "") + (changed ? " changed" : "") + (nested ? " nested" : ""));
-    r.append(el("span", "twisty"), swatch(regionVar(g.kind)));
+    const lazy = g.kind === "unmapped";
+    const r = el("button", "region" + (sel ? " selected" : "") + (changed ? " changed" : "") + (nested ? " nested" : "") + (lazy ? " lazy" : ""));
+    r.append(el("span", "twisty"), lazy ? el("span", "swatch lazy") : swatch(regionVar(g.kind)));
     r.append(el("span", "label", g.label));
     const ptrs = [rip >= a && rip < e ? "rip" : "", rsp > a && rsp <= e ? "rsp" : ""].filter(Boolean);
     r.append(el("span", "ptr", ptrs.join(" ")));
     r.append(el("span", "size", bytes(e - a)));
     const flags = el("span", "flags");
-    flags.append(flag("U", g.user), flag("W", g.writable), flag("X", g.executable));
+    if (!lazy) flags.append(flag("U", g.user), flag("W", g.writable), flag("X", g.executable));
     r.append(flags);
-    r.append(el("span", "range", `${hex(g.va)} – ${hex(g.end)}`));
-    r.title = `${g.pages} page${g.pages > 1 ? "s" : ""} of ${bytes(BigInt(g.pageSize))} → frame${g.pages > 1 ? "s" : ""} from ${hex(g.pa)}`
-      + (g.pages > 1 ? (g.contiguous ? " (contiguous)" : " (not contiguous)") : "");
+    r.append(el("span", "range", `${hex(g.va)} – ${hex(g.end)}` + (g.pa !== null ? `  → pa ${hex(g.pa)}` : "")));
+    const alias = g.pa === null ? [] : (this.data?.regions.regions ?? []).filter((x) => x !== g && x.pa === g.pa && x.kind !== "unmapped");
+    r.title = (alias.length ? `The same frames are also mapped at ${alias.map((x) => `${hex(x.va)} (${x.label})`).join(", ")}\n` : "")
+      + (lazy || g.pa === null
+      ? `${g.pages} page${g.pages > 1 ? "s" : ""} below p->sz with no page-table entry: the process may use them, and the first access to each raises a page fault`
+      : `${g.pages} page${g.pages > 1 ? "s" : ""} of ${bytes(BigInt(g.pageSize))} → frame${g.pages > 1 ? "s" : ""} from ${hex(g.pa)}`
+        + (g.pages > 1 ? (g.contiguous ? " (contiguous)" : " (not contiguous)") : ""));
+    if (alias.length) r.append(el("span", "alias codicon codicon-references"));
     r.onclick = () => {
       this.select({ follow: null, va: sel ? va : a, picked: null });
     };
@@ -304,7 +375,9 @@ export class MemoryPanel extends Panel {
     LEVELS.slice(0, leafLevel + 1).forEach((l, k) => {
       const idx = Number((va >> BigInt(l.lo)) & 0x1ffn);
       const b = el("div", `bits lv${k}`);
-      b.append(el("span", "name", l.name), el("span", "val", String(idx)), el("span", "range", `bits ${l.hi}–${l.lo}`));
+      b.append(el("span", "name", l.name), el("span", "val", String(idx)),
+        el("span", "bin", idx.toString(2).padStart(9, "0")), el("span", "range", `bits ${l.hi}–${l.lo}`));
+      b.title = `bits ${l.hi}–${l.lo} of the address: ${idx.toString(2).padStart(9, "0")} = entry ${idx} of the ${l.name} table`;
       bits.append(b);
     });
     const offBits = leafLevel === 3 ? 12 : leafLevel === 2 ? 21 : 30;
@@ -320,17 +393,20 @@ export class MemoryPanel extends Panel {
       return r;
     };
     const cr3 = el("div", "walk-level");
-    cr3.append(el("span", "what reg", "CR3"), el("span", "val", hex(w.cr3)));
+    const own = this.data && this.data.c.state && BigInt(this.data.c.state.registers.cr3 ?? "0") >> 12n !== BigInt(w.cr3) >> 12n;
+    cr3.append(el("span", "what reg", own ? "root" : "CR3"), el("span", "val", hex(w.cr3)));
+    if (w.table) {
+      const t = el("span", "dim", ` ${w.table}'s page table`);
+      if (own && !memorySpace.value) t.title = "Following a page fault: the faulting process's own page table (p->pagetable), not CR3's (which holds the kernel's while the kernel handles the fault)";
+      cr3.append(t);
+    }
     body.append(cr3, this.frameLink(step("→ PML4 at "), BigInt(w.cr3) & ~0xfffn));
     w.levels.forEach((l, k) => {
       const changed = before !== null && before.levels[k] !== undefined && before.levels[k].entry !== l.entry;
       const r = el("div", "walk-level" + (changed ? " changed" : "") + (l.present ? "" : " absent"));
       const name = el("span", `what lv${k}`, `${l.table}[${l.index}]`);
       name.title = `entry ${l.index} of the ${l.table} table, at physical ${hex(l.entryAddr)}`;
-      const flags = el("span", "flags");
-      flags.append(flag("P", l.present), flag("W", l.writable), flag("U", l.user), flag("NX", l.noExecute));
-      if (l.largePage) flags.append(flag("PS", true));
-      r.append(name, el("span", "val", hex(l.entry)), flags);
+      r.append(name, el("span", "val", hex(l.entry)), pteFlags(BigInt(l.entry), k, w.softBits));
       body.append(r);
       const next = BigInt(l.entry) & 0x000ffffffffff000n;
       if (!l.present) {
@@ -389,7 +465,8 @@ export class MemoryPanel extends Panel {
         const m = el("div", "mapped-at");
         m.append(el("span", "dim", "mapped at "));
         for (const v of f.mappedAt) {
-          const b = el("button", "pa-link", hex(v));
+          const reg = this.data?.regions.regions.find((g) => BigInt(v) >= BigInt(g.va) && BigInt(v) < BigInt(g.end));
+          const b = el("button", "pa-link", hex(v) + (reg ? ` (${reg.label})` : ""));
           b.title = "Walk this virtual address";
           b.onclick = () => {
             this.select({ follow: null, va: BigInt(v), picked: fp });
@@ -405,7 +482,9 @@ export class MemoryPanel extends Panel {
       const old = prev?.dump && prev.dump.pa === fp ? prev.dump.data : null;
       details.append(hexDump(fp, dump.data, old));
     }
-    this.physCol.replaceChildren(head, legend, wrap, this.hoverLine, details);
+    const zoomHead = el("div", "zoom-head dim", "");
+    if (this.data?.framePa != null) zoomHead.textContent = `around frame ${hex(this.data.framePa)}: 1024 frames (4 MB), magnified`;
+    this.physCol.replaceChildren(head, legend, wrap, this.hoverLine, zoomHead, this.zoom, details);
   }
 
   private draw() {
@@ -444,6 +523,46 @@ export class MemoryPanel extends Panel {
     };
     for (const l of d.walk.levels) mark(BigInt(l.entryAddr) & ~0xfffn, color("--accent"));
     if (d.framePa !== null) mark(d.framePa, color("--frame-mark"));
+    this.drawZoom(colors);
+  }
+
+  /** 16 rows of 64 frames around the frame shown, one cell per frame. */
+  private drawZoom(colors: Record<string, string>) {
+    const d = this.data!;
+    if (d.framePa === null) {
+      this.zoom.hidden = true;
+      return;
+    }
+    this.zoom.hidden = false;
+    const frames = d.phys.frames;
+    const cols = 64, rows = 16;
+    const width = this.physCol.clientWidth - 24;
+    const cell = Math.max(4, Math.min(12, Math.floor(width / cols)));
+    const at = Number(d.framePa >> 12n);
+    const first = Math.max(0, Math.min(frames.length - cols * rows, Math.floor(at / cols) * cols - (rows / 2) * cols));
+    this.zoomGeom = { first, cols, cell };
+    const ctx = sizeCanvas(this.zoom, cols * cell, rows * cell);
+    for (let k = 0; k < cols * rows && first + k < frames.length; k++) {
+      ctx.fillStyle = colors[frames[first + k]] ?? colors.o;
+      ctx.fillRect((k % cols) * cell, Math.floor(k / cols) * cell, cell - 1, cell - 1);
+    }
+    const k = at - first;
+    ctx.strokeStyle = cssVar("--frame-mark");
+    ctx.lineWidth = 2;
+    ctx.strokeRect((k % cols) * cell - 1, Math.floor(k / cols) * cell - 1, cell + 1, cell + 1);
+  }
+
+  private zoomCell(ev: MouseEvent): number | null {
+    const { first, cols, cell } = this.zoomGeom;
+    const i = first + Math.floor(ev.offsetY / cell) * cols + Math.floor(ev.offsetX / cell);
+    return this.data && i >= 0 && i < this.data.phys.frames.length ? i : null;
+  }
+
+  private zoomHover(ev: MouseEvent) {
+    const i = this.zoomCell(ev);
+    if (i === null || !this.data) return;
+    const k = this.data.phys.frames[i] as FrameKind;
+    this.hoverLine.textContent = `${hex(BigInt(i) * 4096n)} · ${KIND_NAMES[k] ?? k}`;
   }
 
   private cellAt(ev: MouseEvent): number | null {
@@ -468,6 +587,11 @@ export class MemoryPanel extends Panel {
 /** Scroll col (only) so that e is in view. */
 function reveal(col: HTMLElement, e: Element | null) {
   if (!e) return;
+  /* narrow: the columns stack and the panel scrolls, not the column */
+  if (col.scrollHeight <= col.clientHeight) {
+    (e as HTMLElement).scrollIntoView({ block: "nearest" });
+    return;
+  }
   const top = (e as HTMLElement).offsetTop - col.offsetTop;
   revealY(col, top, (e as HTMLElement).offsetHeight);
 }
@@ -496,8 +620,53 @@ function swatch(v: string): HTMLElement {
   return s;
 }
 
-function flag(name: string, on: boolean): HTMLElement {
-  return el("span", "flag" + (on ? " on" : ""), name);
+function flag(name: string, on: boolean, title?: string): HTMLElement {
+  const f = el("span", "flag" + (on ? " on" : ""), name);
+  if (title) f.title = `${name} = ${on ? 1 : 0}: ${title}`;
+  return f;
+}
+
+/* the bits of a page-table entry (Intel SDM vol. 3, 4.5), by bit number */
+const PTE_BITS: [number, string, string][] = [
+  [0, "P", "present"],
+  [1, "W", "writable"],
+  [2, "U", "user mode may access it"],
+  [3, "PWT", "page-level write-through"],
+  [4, "PCD", "page-level cache disable"],
+  [5, "A", "accessed"],
+  [6, "D", "dirty"],
+  [7, "PS", "page size: this entry maps a large page"],
+  [8, "G", "global: kept in the TLB across cr3 loads"],
+  [63, "NX", "no execute"],
+];
+
+/**
+ * Every bit of an entry, named, with the frame address; D and G mean
+ * something only in a leaf; bits 9-11 by the kernel's own names, where it
+ * keeps flags of its own in them (the MMU ignores them).
+ */
+function pteFlags(e: bigint, level: number, soft: SoftBit[] = []): HTMLElement {
+  const flags = el("span", "flags");
+  const leaf = level === 3 || (e & 0x80n) !== 0n;
+  for (const [bit, name, what] of PTE_BITS) {
+    if (!leaf && (name === "D" || name === "G")) continue;
+    if (level === 0 && name === "PS") continue;
+    if (name === "A" || name === "D") {
+      /* the MMU sets them itself; QEMU gives plugins no callback for those
+       * writes, so the recorded value says nothing about them */
+      const f = el("span", "flag unknown", name + "?");
+      f.title = `${name} (${what}): set by the MMU when the page is used. The recording does not see the MMU's own writes, so its value here is not known.`;
+      flags.append(f);
+      continue;
+    }
+    flags.append(flag(name, ((e >> BigInt(bit)) & 1n) === 1n, what));
+    if (bit === 8)
+      for (const sb of soft)
+        flags.append(flag(sb.name, ((e >> BigInt(sb.bit)) & 1n) === 1n,
+          `bit ${sb.bit}, ignored by the MMU: the kernel's own flag${sb.what ? ` (${sb.what})` : ""}`));
+  }
+  flags.title = `address bits 51–12: ${hex(e & 0x000ffffffffff000n)}`;
+  return flags;
 }
 
 function gapRow(size: bigint, small = false, label = small ? "guard page (unmapped)" : "unmapped"): HTMLElement {

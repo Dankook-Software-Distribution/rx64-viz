@@ -6,7 +6,7 @@
 
 import { api, type Stack, type StackFrame } from "../api";
 import { cursor, hover, type CursorState } from "../cursor";
-import { grouped, hex } from "../format";
+import { flags, grouped, hex, selector } from "../format";
 import { el, GLYPH, note, Panel, placeholder } from "./panel";
 
 export class StackPanel extends Panel {
@@ -58,7 +58,8 @@ export class StackPanel extends Panel {
     }
     if (signal.aborted) return;
     const before = this.last && this.last.rid === c.rec.id && this.last.step === c.prev?.step ? this.last.values : null;
-    this.last = { rid: c.rec.id, step: st.step, values: new Map(st.slots.map((x) => [x.addr, x.value])) };
+    /* unmapped slots are not values: a slot that only became readable (riscv-style's cr3 switch) did not change */
+    this.last = { rid: c.rec.id, step: st.step, values: new Map(st.slots.filter((x) => x.mapped).map((x) => [x.addr, x.value])) };
     this.render(st, before);
   }
 
@@ -87,9 +88,11 @@ export class StackPanel extends Panel {
         const x = st.slots[i];
         const a = BigInt(x.addr);
         if (a < from || a >= to) continue;
-        const changed = before !== null && before.get(x.addr) !== undefined && before.get(x.addr) !== x.value;
-        const r = el("div", `slot kind-${f.kind}` + (changed ? " changed" : "") + (f === st.frames[0] ? " current" : "") + (a < (rsp & ~7n) ? " below" : ""));
+        const changed = x.mapped && before !== null && before.get(x.addr) !== undefined && before.get(x.addr) !== x.value;
+        const r = el("div", `slot kind-${f.kind}` + (changed ? " changed" : "") + (f === st.frames[0] ? " current" : "")
+          + (a < (rsp & ~7n) ? " below" : "") + (x.stale ? " stale" : ""));
         if (a < (rsp & ~7n)) r.title = "Below rsp: not pushed by this trap yet";
+        if (x.stale) r.title = "Not written in this trap yet: the value is left over from an earlier one";
         r.dataset.addr = hex(x.addr);
         const marks = el("span", "marks");
         if (a === (rsp & ~7n)) {
@@ -108,9 +111,29 @@ export class StackPanel extends Panel {
         const meaning = el("span", "meaning");
         if (x.label === "return address") meaning.append(el("span", "field", "return to"));
         else if (x.label) meaning.append(el("span", "field", x.label.replace(/^trapframe\./, "")));
+        const decoded = decode(x.label, x.value, st.slots, f.function);
+        if (decoded) meaning.append(el("span", "target", decoded));
+        if (x.writer) {
+          const w = el("span", "writer" + (x.writer === "CPU" ? " cpu" : ""), x.writer);
+          w.title = x.writer === "CPU"
+            ? "Pushed by the CPU itself while delivering the trap"
+            : `Stored by ${x.writer} (the last store to this slot before the cursor)`;
+          meaning.append(w);
+        }
+        if (x.stale) {
+          const w = el("span", "writer stale", "not written yet");
+          w.title = "No store has written this slot since the trap began: what it holds is left over from an earlier trap";
+          meaning.append(w);
+        }
+        const text = x.mapped && !x.target && !decoded ? ascii(x.value) : null;
         if (x.target) meaning.append(el("span", "target", x.target));
         else if (x.mapped && onStack(x.value) && BigInt(x.value) !== a)
           meaning.append(el("span", "ref", "→ this stack"));
+        else if (text) {
+          const t = el("span", "target tk-string", `"${text}"`);
+          t.title = "These 8 bytes read as text (little-endian, as a string in memory)";
+          meaning.append(t);
+        }
         meaning.title = [x.label, x.target].filter(Boolean).join(" ");
         r.append(marks, addr, val, meaning);
         frag.append(r);
@@ -134,4 +157,41 @@ export class StackPanel extends Panel {
     }
     return h;
   }
+}
+
+/**
+ * A trap frame field's bits by name: the page-fault error code (Intel SDM
+ * vol. 3, 4.7), the pushed rflags, a selector.
+ */
+function decode(label: string | null, value: string, slots: { label: string | null; value: string }[],
+                frame: string | null): string | null {
+  if (!label) return null;
+  const v = BigInt(value);
+  const field = label.replace(/^trapframe\./, "");
+  if (field === "err" || label === "error code") {
+    /* the stub pushes trapno after the CPU pushed err: the frame's name tells first */
+    const trapno = slots.find((s) => s.label === "trapframe.trapno");
+    const pf = trapno ? BigInt(trapno.value) === 14n : (frame ?? "").startsWith("page fault");
+    if (!pf) return null;
+    return [(v & 1n) ? "page present (rights violated)" : "page not present",
+      (v & 2n) ? "write" : "read", (v & 4n) ? "user mode" : "kernel mode",
+      ...((v & 16n) ? ["instruction fetch"] : []), ...((v & 8n) ? ["reserved bit set"] : [])].join(" · ");
+  }
+  if (field === "rflags" || field === "eflags") return flags("eflags", value).join(" ") || "no flags set";
+  if (field === "cs" || field === "ss") return v ? selector(value) : "null selector";
+  if (field === "rax" && (frame ?? "").startsWith("syscall "))
+    return `${frame!.slice(8)}'s number on entry; syscall() stores the result here`;
+  return null;
+}
+
+/** The 8 bytes of v as text, if they are one: 3 or more printable characters, then only zero bytes. */
+function ascii(v: string): string | null {
+  let b = BigInt(v), out = "", ended = false;
+  for (let i = 0; i < 8; i++, b >>= 8n) {
+    const c = Number(b & 0xffn);
+    if (c === 0) ended = true;
+    else if (ended || c < 0x20 || c > 0x7e) return null;
+    else out += String.fromCharCode(c);
+  }
+  return out.length >= 3 ? out : null;
 }

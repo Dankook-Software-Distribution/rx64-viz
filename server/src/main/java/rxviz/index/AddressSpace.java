@@ -32,8 +32,45 @@ public final class AddressSpace {
                          long pageSize, int pages) {
     }
 
-    /** paging: false while CR0.PG is off (no regions then: addresses are physical). */
-    public record Layout(boolean paging, long cr3, String program, List<Region> regions, int tables) {
+    /**
+     * paging: false while CR0.PG is off (no regions then: addresses are
+     * physical). tables: page-table pages reachable from cr3; userTables:
+     * those of the user half (the rest are shared with every process).
+     * sz: p->sz of the process this page table belongs to (-1 if none).
+     */
+    public record Layout(boolean paging, long cr3, String program, List<Region> regions, int tables,
+                         int userTables, long sz) {
+
+        /**
+         * With p->sz known: the user addresses below it that no page maps
+         * (sbrk grew the process, nothing touched them yet) as regions of
+         * kind "unmapped".
+         */
+        Layout withSz(long sz) {
+            if (!paging || sz <= 0)
+                return this;
+            long top = (sz + 4095) & ~4095L;
+            List<Region> out = new ArrayList<>();
+            long at = 0;
+            for (Region g : regions) {
+                if (Long.compareUnsigned(at, top) < 0 && Long.compareUnsigned(g.va(), at) > 0) {
+                    long end = Long.compareUnsigned(g.va(), top) < 0 ? g.va() : top;
+                    out.add(gap(at, end));
+                }
+                out.add(g);
+                if (Long.compareUnsigned(g.end(), at) > 0)
+                    at = g.end();
+            }
+            if (Long.compareUnsigned(at, top) < 0)
+                out.add(gap(at, top));
+            out.sort((x, y) -> Long.compareUnsigned(x.va(), y.va()));
+            return new Layout(paging, cr3, program, out, tables, userTables, sz);
+        }
+
+        private static Region gap(long va, long end) {
+            return new Region(va, end, "unmapped", "below p->sz, not mapped", false, true, false,
+                    -1, false, 4096, (int) ((end - va) >>> 12));
+        }
     }
 
     /**
@@ -51,70 +88,90 @@ public final class AddressSpace {
     public record Frame(long pa, String kind, List<Long> mappedAt, int freeIndex) {
     }
 
-    private record Leaf(long va, long pa, long size, boolean w, boolean u, boolean nx) {
+    /** A leaf mapping; pte: physical address of its page-table entry. */
+    record Leaf(long va, long pa, long size, boolean w, boolean u, boolean nx, long pte) {
     }
 
     private final Recording r;
     private final KernelProfile kernel;
     final int step;
+    /* the page table asked for, or -1 for CR3's */
+    final long root;
     private final long cr3;
     private final boolean paging;
     private final Program prog;
     /* computed once from memory at step: shared by map(), physMap(), frame() */
     private final Walked walked;
+    private final int userTables;
     private final String[][] names;
     private final FreeList free;
     private final byte[] frames;
     private Map<Long, Integer> freeIndex;
 
-    /** The address space and physical frames at step (Recording keeps the last one). */
-    AddressSpace(Recording r, int step) {
+    /**
+     * The address space and physical frames at step (Recording keeps the
+     * last one): of CR3, or with root >= 0 of the page table at root (a
+     * process's, which need not be the one in use).
+     */
+    AddressSpace(Recording r, int step, long root) {
         this.r = r;
         this.kernel = r.kernel();
         this.step = step;
+        this.root = root;
         long[] regs = r.registers(step);
-        this.cr3 = regs[r.regIndex("cr3")];
-        this.paging = r.paging(step);
-        this.prog = r.programAt(cr3, step);
+        this.cr3 = root >= 0 ? root : regs[r.regIndex("cr3")];
+        this.paging = root >= 0 || r.paging(step);
+        this.prog = paging ? r.programIn(cr3, step) : null;
         Object[] got = r.memory(step, img -> {
-            Walked w = paging ? walk(img, cr3) : new Walked(List.of(), List.of());
-            return new Object[] {w, freeList(img), img.size()};
+            Walked w = paging ? walk(img, cr3, false) : new Walked(List.of(), List.of());
+            int own = paging ? walk(img, cr3, true).tables().size() : 0;
+            return new Object[] {w, freeList(kernel, img), img.size(), own};
         });
         this.walked = (Walked) got[0];
+        this.userTables = (Integer) got[3];
         this.free = (FreeList) got[1];
-        this.names = names(walked.leaves(), prog);
+        this.names = names(kernel, walked.leaves(), prog, (Long) got[2]);
         this.frames = frameKinds((Long) got[2]);
     }
 
     private static final long USER_TOP = 1L << 47;
 
-    private static boolean userHalf(long va) {
+    static boolean userHalf(long va) {
         return Long.compareUnsigned(va, USER_TOP) < 0;
     }
 
-    private record Walked(List<Leaf> leaves, List<Long> tables) {
+    record Walked(List<Leaf> leaves, List<Long> tables) {
     }
 
-    private Walked walk(MemoryImage img, long cr3) {
+    /** The mappings and tables of the page table at cr3 (lower: the user half only). */
+    static Walked walk(MemoryImage img, long cr3, boolean lower) {
         List<Leaf> leaves = new ArrayList<>();
         List<Long> tables = new ArrayList<>();
-        img.enumerate(cr3, new MemoryImage.Mappings() {
+        java.util.Set<Long> seen = new java.util.HashSet<>();
+        MemoryImage.Mappings m = new MemoryImage.Mappings() {
             @Override
             public void table(long pa, int level) {
-                tables.add(pa);
+                /* a table two entries point at (the boot page table's shared
+                 * PDPT) is one page */
+                if (seen.add(pa))
+                    tables.add(pa);
             }
 
             @Override
             public void leaf(long va, long pa, long size, boolean writable, boolean user,
-                             boolean noExecute, long entry) {
-                leaves.add(new Leaf(va, pa, size, writable, user, noExecute));
+                             boolean noExecute, long entry, long entryAddr) {
+                leaves.add(new Leaf(va, pa, size, writable, user, noExecute, entryAddr));
             }
-        });
+        };
+        if (lower)
+            img.enumerateLower(cr3, m);
+        else
+            img.enumerate(cr3, m);
         return new Walked(leaves, tables);
     }
 
     /** Kind and label of every leaf, in order. */
-    private String[][] names(List<Leaf> leaves, Program prog) {
+    static String[][] names(KernelProfile kernel, List<Leaf> leaves, Program prog, long ram) {
         int n = leaves.size();
         String[][] out = new String[n][];
         for (int i = 0; i < n; i++) {
@@ -129,10 +186,15 @@ public final class AddressSpace {
                     && leaves.get(i - 1).va() + leaves.get(i - 1).size() == l.va()
                     && leaves.get(i + 1).va() == l.va() + l.size();
             KernelProfile.Region g = guard ? null : kernel.what(l.va());
+            if (g != null && g.kind().equals("device") && l.pa() >= 0
+                    && (l.pa() < ram || (g.pa() >= 0 && l.pa() != g.pa() + (l.va() - g.va()))))
+                g = null; /* device addresses mapped elsewhere (the boot page table's large pages) */
             if (guard)
                 out[i] = new String[] {"guard", "guard page (no U)"};
             else if (g != null)
                 out[i] = new String[] {g.kind(), g.label()};
+            else if (l.pa() >= ram)
+                out[i] = new String[] {"other", "no RAM here (physical addresses past the end of RAM)"};
             else
                 out[i] = new String[] {"kernel", "kernel"};
         }
@@ -165,7 +227,7 @@ public final class AddressSpace {
 
     Layout map() {
         if (!paging)
-            return new Layout(false, cr3, null, List.of(), 0);
+            return new Layout(false, cr3, null, List.of(), 0, 0, -1);
         Walked w = walked;
         {
             List<Region> out = new ArrayList<>();
@@ -198,28 +260,36 @@ public final class AddressSpace {
                 next = l.va() + l.size();
                 nextPa = l.pa() + l.size();
             }
-            return new Layout(true, cr3, prog == null ? null : prog.name(), out, w.tables().size());
+            return new Layout(true, cr3, prog == null ? null : prog.name(), out, w.tables().size(),
+                    userTables, -1);
         }
     }
 
     /* ---------------- physical frames ---------------- */
 
-    private record FreeList(long head, List<Long> frames, String error) {
+    record FreeList(long head, List<Long> frames, String error) {
+    }
+
+    /** Physical address of kmem.freelist (the list's head pointer), or -1 if the kernel has none. */
+    static long freeListAddr(KernelProfile kernel) {
+        Structs.Struct kmem = kernel.structs().ofVariable("kmem");
+        long va = kernel.kernelElf().addressOf("kmem");
+        if (kmem == null || kmem.member("freelist") == null || va == -1)
+            return -1;
+        long pa = kernel.kernelElf().physOf(va);
+        return pa < 0 ? -1 : pa + kmem.member("freelist").offset();
     }
 
     /** kmem.freelist: struct run pages linked through run.next. */
-    private FreeList freeList(MemoryImage img) {
-        Structs st = kernel.structs();
-        Structs.Struct kmem = st.ofVariable("kmem");
-        Structs.Struct run = st.get("run");
-        long va = kernel.kernelElf().addressOf("kmem");
-        if (kmem == null || kmem.member("freelist") == null || run == null || va == -1)
+    static FreeList freeList(KernelProfile kernel, MemoryImage img) {
+        Structs.Struct run = kernel.structs().get("run");
+        long headPa = freeListAddr(kernel);
+        if (headPa < 0 || run == null)
             return new FreeList(0, List.of(), "no kmem.freelist in the kernel's symbols");
-        long pa = kernel.kernelElf().physOf(va);
-        if (pa < 0 || !img.contains(pa + kmem.member("freelist").offset(), 8))
+        if (!img.contains(headPa, 8))
             return new FreeList(0, List.of(), "kmem is not in memory");
         long nextOff = run.member("next") == null ? 0 : run.member("next").offset();
-        long head = img.read(pa + kmem.member("freelist").offset(), 8);
+        long head = img.read(headPa, 8);
         List<Long> frames = new ArrayList<>();
         long limit = img.size() / 4096 + 1;
         for (long p = head; p != 0; ) {
@@ -257,7 +327,8 @@ public final class AddressSpace {
             set(f, a, 'f');
         for (int i = 0; i < walked.leaves().size(); i++) {
             Leaf l = walked.leaves().get(i);
-            char c = l.u() ? 'u' : names[i][0].equals("kstack") ? 's'
+            /* the guard page is the process's own page, mapped without U */
+            char c = l.u() || names[i][0].equals("guard") ? 'u' : names[i][0].equals("kstack") ? 's'
                     : kernelMapped(names[i][0]) ? 'x' : 0;
             if (c != 0)
                 for (long a = l.pa(); a < l.pa() + l.size(); a += 4096)

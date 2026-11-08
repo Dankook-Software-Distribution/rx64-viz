@@ -875,12 +875,28 @@ button.stack-frame:hover {
 .panel.memory {
   overflow: hidden;
   container-type: inline-size;
+  display: flex;
+  flex-direction: column;
+}
+
+.mem-space {
+  flex: none;
+  padding: 4px 12px;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--changed-bg);
+  border-bottom: 1px solid var(--line);
+}
+
+.mem-space[hidden] {
+  display: none;
 }
 
 .memory-cols {
   display: grid;
   grid-template-columns: minmax(300px, 1.15fr) minmax(280px, 1fr) minmax(300px, 1.1fr);
-  height: 100%;
+  flex: 1;
+  min-height: 0;
 }
 
 .mem-col {
@@ -930,9 +946,6 @@ button.stack-frame:hover {
 .mem-head .sub {
   font-size: 12px;
   color: var(--faint);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .swatch {
@@ -1115,6 +1128,22 @@ button.stack-frame:hover {
   font-family: var(--mono);
   font-size: 13px;
   color: var(--lv);
+}
+
+.va-bits .bin {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--dim);
+  letter-spacing: -0.5px;
+}
+
+.swatch.lazy {
+  background: repeating-linear-gradient(45deg, var(--m-user) 0 2px, transparent 2px 4px);
+  border: 1px dashed var(--m-user);
+}
+
+.region.lazy .label {
+  font-style: italic;
 }
 
 .va-bits .range {
@@ -1447,12 +1476,17 @@ button.stack-frame:hover {
   color: var(--text);
 }
 
-.slept {
+/* a small pill in a row's second line (slept, woken, handler) */
+.pill {
   display: inline-flex;
   align-items: center;
   gap: 2px;
   padding: 0 6px;
-  height: 16px;
+  min-height: 16px;
+  max-width: 100%;
+  line-height: 14px;
+  white-space: normal;
+  text-align: left;
   border: 1px solid var(--input-border);
   border-radius: 8px;
   background: none;
@@ -1461,12 +1495,12 @@ button.stack-frame:hover {
   cursor: pointer;
 }
 
-.slept:hover {
+.pill:hover {
   color: var(--text);
   background: var(--hover);
 }
 
-.slept .codicon {
+.pill .codicon {
   font-size: 11px !important;
 }
 
@@ -1567,3 +1601,911 @@ button.stack-frame:hover {
   color: var(--icon-debug);
   font-weight: 700;
 }
+
+/* Processes */
+.panel.processes {
+  font-size: 12px;
+}
+
+.proc-table {
+  padding-bottom: 8px;
+  min-width: 860px;
+}
+
+.pt-row {
+  display: grid;
+  grid-template-columns: 16px 9ch 4ch 9ch 10ch minmax(20ch, 1.4fr) 12ch 6ch minmax(14ch, 1fr) 22px;
+  column-gap: 10px;
+  align-items: baseline;
+  padding: 2px 10px 2px 6px;
+  cursor: pointer;
+  border-left: 2px solid transparent;
+}
+
+.pt-row > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pt-row:hover:not(.pt-head) {
+  background: var(--hover);
+}
+
+.pt-row.pt-head {
+  cursor: default;
+  font-size: 11px;
+  color: var(--dim);
+  position: sticky;
+  top: 25px;
+  z-index: 1;
+  background: var(--editor);
+  border-bottom: 1px solid var(--line);
+}
+
+.pt-row.on-cpu {
+  background: var(--frame-bg);
+  border-left-color: var(--frame-mark);
+}
+
+.pt-row .glyph {
+  align-self: center;
+  color: var(--dim);
+  font-size: 12px !important;
+}
+
+.pt-row .pslot,
+.pt-row .pid,
+.pt-row .size {
+  font-family: var(--mono);
+  color: var(--faint);
+}
+
+.pt-row .pid {
+  color: var(--text);
+}
+
+.pt-row .name {
+  color: var(--user);
+}
+
+.pt-row .fn {
+  font-family: var(--mono);
+  color: var(--tk-function);
+}
+
+.pt-row .chan,
+.pt-row .fds {
+  font-family: var(--mono);
+  color: var(--tk-variable);
+}
+
+.pt-row .state .badge {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.pt-row.state-running .state .badge {
+  color: var(--editor);
+  background: var(--frame-mark);
+}
+
+.pt-row.state-runnable .state .badge {
+  color: var(--tk-function);
+}
+
+.pt-row.state-zombie .state .badge {
+  color: var(--bad);
+}
+
+.pt-row.state-used .state .badge {
+  color: var(--faint);
+}
+
+.pt-row .changed,
+.pt-row.new > span:not(.glyph) {
+  color: var(--changed);
+}
+
+.pt-row .changed .badge,
+.pt-row.new .badge {
+  outline: 1px solid var(--changed);
+}
+
+.pt-row.new {
+  background: var(--changed-bg);
+}
+
+.pt-detail {
+  margin: 0 10px 6px 40px;
+  padding: 4px 8px;
+  border-left: 1px solid var(--line);
+}
+
+.pt-detail .kv {
+  display: grid;
+  grid-template-columns: 16ch minmax(0, 1fr);
+  gap: 8px;
+  padding: 1px 0;
+}
+
+.pt-detail .k {
+  font-family: var(--mono);
+  color: var(--tk-variable);
+}
+
+.pt-detail .v {
+  font-family: var(--mono);
+  overflow-wrap: anywhere;
+}
+
+/* Changes */
+.panel.changes {
+  font-size: 12px;
+  background: var(--side);
+}
+
+.changes-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 5px 10px;
+  background: var(--side);
+  border-bottom: 1px solid var(--line);
+}
+
+.changes-head:empty {
+  display: none;
+}
+
+.ch-title {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.ch-title .glyph {
+  align-self: center;
+  color: var(--tk-function);
+}
+
+.ch-title .call {
+  font-family: var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.ch-title .proc {
+  margin-left: auto;
+  flex: none;
+  color: var(--user);
+}
+
+.ch-sub {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.changes {
+  padding-bottom: 10px;
+}
+
+.ch-slept {
+  margin: 6px 10px 0;
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.ch-section {
+  margin-top: 8px;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+.ch-sub-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 5px;
+  align-items: baseline;
+  padding: 3px 10px 1px;
+}
+
+.ch-sub-head .ch-slot {
+  font-family: var(--mono);
+  color: var(--faint);
+}
+
+.ch-sub-head .name {
+  color: var(--user);
+}
+
+.ch-sub-head .badge {
+  margin-left: 4px;
+}
+
+.ch-sub-head.kind-created .badge {
+  color: var(--changed);
+  background: var(--changed-bg);
+}
+
+.ch-sub-head.kind-freed .badge {
+  color: var(--bad);
+}
+
+.ch-row {
+  display: grid;
+  grid-template-columns: 10px 12ch minmax(0, 1fr);
+  column-gap: 6px;
+  align-items: baseline;
+  padding: 2px 10px 2px 14px;
+  border-left: 2px solid transparent;
+}
+
+.ch-row.link {
+  cursor: pointer;
+}
+
+.ch-row.link:hover {
+  background: var(--hover);
+}
+
+.ch-row .mark::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--changed);
+}
+
+.ch-row.pending .mark::before {
+  background: none;
+  border: 1px solid var(--faint);
+  width: 4px;
+  height: 4px;
+}
+
+.ch-row.partial .mark::before {
+  background: linear-gradient(90deg, var(--changed) 50%, transparent 50%);
+  border: 1px solid var(--changed);
+  width: 4px;
+  height: 4px;
+}
+
+.ch-free .mark::before {
+  display: none;
+}
+
+.ch-row.pending .what,
+.ch-row.pending .change,
+.ch-row.pending .change * {
+  color: var(--faint);
+}
+
+.ch-row .what {
+  color: var(--tk-variable);
+  font-family: var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ch-row .change {
+  font-family: var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.ch-row .before {
+  color: var(--dim);
+}
+
+.ch-row .before.dim,
+.ch-row .after.dim {
+  color: var(--faint);
+  font-style: italic;
+}
+
+.ch-row .after {
+  color: var(--changed);
+}
+
+.ch-row .arrow {
+  color: var(--faint);
+}
+
+.ch-row .verb {
+  color: var(--dim);
+  font-family: var(--ui);
+}
+
+.ch-row .va {
+  color: var(--tk-number);
+}
+
+.ch-row.frames-allocated .what,
+.ch-row.map-mapped .what {
+  color: var(--user);
+}
+
+.ch-row.frames-freed .what,
+.ch-row.map-unmapped .what {
+  color: var(--bad);
+}
+
+.ch-row .by {
+  grid-column: 3;
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.ch-row.other .what,
+.ch-row.other .change {
+  opacity: 0.75;
+}
+
+/* CPU */
+.panel.cpu {
+  font-size: 12px;
+  background: var(--side);
+}
+
+.cpu-view {
+  padding-bottom: 10px;
+}
+
+.cpu-section {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  margin-top: 6px;
+  padding: 3px 8px;
+  border: 0;
+  background: none;
+  color: var(--dim);
+  font: 700 11px var(--ui);
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  text-align: left;
+}
+
+.cpu-section:hover {
+  color: var(--text);
+}
+
+.cpu-load {
+  padding: 2px 12px 4px 26px;
+  font-family: var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.cpu-load .k,
+.cpu-row .k {
+  color: var(--tk-variable);
+  margin-right: 8px;
+}
+
+.cpu-load .name {
+  color: var(--tk-type);
+}
+
+.cpu-load .loaded {
+  font-family: var(--ui);
+  font-size: 11px;
+  margin-top: 1px;
+}
+
+.cpu-load .fn,
+.cpu-row .fn {
+  font-family: var(--mono);
+  color: var(--tk-function);
+}
+
+.cpu-load.changed .v,
+.cpu-row.changed .val,
+.cpu-row.changed .what,
+.cpu-row.changed .fn {
+  color: var(--changed);
+  background: var(--changed-bg);
+  border-radius: 2px;
+}
+
+button.link {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+
+button.link:hover {
+  text-decoration: underline;
+}
+
+.cpu-row {
+  display: grid;
+  align-items: baseline;
+  column-gap: 8px;
+  padding: 1px 12px 1px 26px;
+  border-left: 2px solid transparent;
+}
+
+.cpu-row > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cpu-row.seg {
+  grid-template-columns: 5ch 5ch minmax(0, 1fr) max-content;
+}
+
+.cpu-row.tss {
+  grid-template-columns: 7ch max-content minmax(0, 1fr);
+}
+
+.cpu-row.gate {
+  grid-template-columns: 7ch minmax(0, 1.2fr) minmax(0, 1fr) minmax(9ch, max-content) 4ch;
+}
+
+.cpu-row.gate-head > span {
+  overflow: visible;
+}
+
+.cpu-row.gate-head {
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.cpu-row .idx,
+.cpu-row .sel,
+.cpu-row .val,
+.cpu-row .dpl,
+.cpu-row .type {
+  font-family: var(--mono);
+}
+
+.cpu-row .idx,
+.cpu-row .sel {
+  color: var(--faint);
+}
+
+.cpu-row .val {
+  color: var(--text);
+}
+
+.cpu-row.tss .what {
+  color: var(--dim);
+}
+
+.cpu-row .type {
+  color: var(--dim);
+}
+
+.cpu-row.seg.kind-null .what,
+.cpu-row.seg.kind-tss-high .what {
+  color: var(--faint);
+}
+
+.cpu-row.seg.kind-code .what {
+  color: var(--kernel);
+}
+
+.cpu-row.seg.kind-tss .what {
+  color: var(--trap);
+}
+
+.cpu-row.seg.selected {
+  background: var(--active-row);
+}
+
+.reg-chip {
+  margin-left: 4px;
+  padding: 0 5px;
+  border-radius: 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--tk-variable);
+  background: var(--input);
+}
+
+.cpu-row.gate.user .dpl,
+.cpu-row.gate.user .what {
+  color: var(--user);
+  font-weight: 600;
+}
+
+.cpu-row.gate.in-use {
+  background: var(--frame-bg);
+  border-left-color: var(--frame-mark);
+}
+
+/* Syscalls: folded runs and handler links */
+.sc-row.sc-group .glyph {
+  color: var(--dim);
+}
+
+.sc-row .times {
+  color: var(--dim);
+  font-family: var(--ui);
+}
+
+.sc-row.member {
+  padding-left: 22px;
+  background: color-mix(in srgb, var(--side) 85%, var(--line));
+}
+
+.pill.handler {
+  display: none;
+  font-family: var(--mono);
+  color: var(--tk-function);
+}
+
+/* Changes: in time order */
+.ch-row.ch-moment {
+  grid-template-columns: 10px minmax(0, 1fr);
+}
+
+.ch-moment .body {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.ch-moment .head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 4px;
+}
+
+.ch-moment .obj {
+  color: var(--user);
+}
+
+.ch-moment .field {
+  font-family: var(--mono);
+  color: var(--tk-variable);
+}
+
+.ch-moment .who {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.ch-moment .who.me {
+  color: var(--dim);
+}
+
+.ch-row.pending .obj,
+.ch-row.pending .field {
+  color: var(--faint);
+}
+
+.pt-mem {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--dim);
+  cursor: pointer;
+  align-self: center;
+}
+
+.pt-mem:hover {
+  color: var(--text);
+}
+
+.sc-row.current .handler,
+.sc-row:hover .handler {
+  display: inline-flex;
+}
+
+.walk-level .flags {
+  flex-wrap: wrap;
+  white-space: normal;
+}
+
+.asm-mem {
+  display: flex;
+  gap: 0;
+  align-items: baseline;
+  flex-wrap: wrap;
+  padding-left: calc(var(--gutter, 18px) + 9ch);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.asm-mem .gutter {
+  display: none;
+}
+
+.asm-mem .mem-name {
+  margin-left: 6px;
+  color: var(--tk-variable, var(--text));
+}
+
+.asm-mem .mem-name::before {
+  content: "[";
+  color: var(--faint);
+}
+
+.asm-mem .mem-name::after {
+  content: "]";
+  color: var(--faint);
+}
+
+.asm-mem .mem-val {
+  color: var(--text);
+}
+
+.ch-moment .in-call {
+  margin-left: 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--faint);
+}
+
+.row .row-act {
+  visibility: hidden;
+  margin-left: auto;
+  padding: 0 4px;
+  border: 0;
+  background: none;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.row:hover .row-act {
+  visibility: visible;
+}
+
+.row .row-act:hover {
+  color: var(--text);
+}
+
+.sc-pid {
+  color: var(--faint);
+  font-size: 10px;
+}
+
+.sc-more .earlier {
+  font-size: 11px;
+  color: var(--faint);
+  font-style: italic;
+}
+
+.slept.preempted {
+  border-style: dashed;
+}
+
+.store .st-addr {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.store .st-name {
+  color: var(--tk-variable, var(--dim));
+  font-family: var(--ui);
+}
+
+.flag.unknown {
+  opacity: 0.6;
+  font-style: italic;
+  text-decoration: underline dotted;
+}
+
+.region .alias {
+  font-size: 11px !important;
+  color: var(--dim);
+}
+
+.phys-zoom {
+  display: block;
+  margin: 4px 12px 8px;
+  cursor: pointer;
+}
+
+.zoom-head {
+  padding: 2px 12px;
+  font-size: 11px;
+}
+
+@container (max-width: 720px) {
+  .memory-cols > .mem-col:nth-child(2) {
+    order: -1;
+  }
+}
+
+.reg-group.two-col {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  column-gap: 12px;
+}
+
+.reg-group.two-col > h3 {
+  grid-column: 1 / -1;
+}
+
+.reg .name.just::before {
+  content: "•";
+  color: var(--frame-mark);
+  margin-right: 3px;
+  margin-left: -9px;
+}
+
+.cpu-mode {
+  padding: 6px 12px;
+  font-size: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.cpu-mode .k {
+  color: var(--dim);
+  margin-right: 8px;
+}
+
+.cpu-mode .v {
+  font-family: var(--mono);
+}
+
+.item.warn {
+  font-weight: 600;
+}
+
+.asm-mem .mem-addr {
+  border: 0;
+  padding: 0;
+  background: none;
+  font: inherit;
+  color: var(--tk-number);
+  cursor: pointer;
+  text-decoration: underline dotted;
+}
+
+.asm-mem.ahead {
+  opacity: 0.75;
+}
+
+.asm-mem .mem-val.after {
+  color: var(--changed, var(--accent));
+  font-weight: 600;
+}
+
+.asm-cpu {
+  margin: 2px 0 4px calc(var(--gutter, 18px) + 2ch);
+  padding: 4px 8px;
+  border-left: 2px solid var(--frame-mark);
+  background: var(--hover);
+  font-family: var(--mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.asm-cpu .cpu-title {
+  font-family: var(--ui);
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 2px;
+}
+
+.asm-cpu .cpu-line {
+  display: flex;
+  gap: 8px;
+  white-space: normal;
+}
+
+.asm-cpu .cpu-line .k {
+  flex: none;
+  width: 7ch;
+  color: var(--dim);
+}
+
+.slot .writer {
+  margin-left: 6px;
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: 10px;
+  color: var(--dim);
+  border: 1px solid var(--line);
+}
+
+.slot .writer.cpu {
+  color: var(--frame-mark);
+  border-color: var(--frame-mark);
+}
+
+.vars {
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 4px 0;
+}
+
+.var {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  padding: 2px 12px;
+}
+
+.var .vname {
+  color: var(--tk-variable, var(--text));
+}
+
+.var .vtype {
+  color: var(--tk-type);
+  font-size: 11px;
+}
+
+.var .vval {
+  color: var(--text);
+}
+
+.var .vval.link {
+  cursor: pointer;
+  text-decoration: underline dotted;
+}
+
+.var.changed .vval {
+  color: var(--changed, var(--accent));
+  font-weight: 600;
+}
+
+.var.none .vval {
+  color: var(--faint);
+}
+
+.var .vpoints {
+  color: var(--dim);
+  font-family: var(--ui);
+  font-size: 11px;
+}
+
+.var .vwhere {
+  flex-basis: 100%;
+  padding-left: 2ch;
+  color: var(--faint);
+  font-family: var(--ui);
+  font-size: 10px;
+}
+
+.timeline-marks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px 8px;
+}
+
+.timeline-marks:empty {
+  display: none;
+}
+
+/* a trap-frame slot not written in this trap: an older value */
+.slot.stale .val { opacity: 0.5; }
+.slot .writer.stale { color: var(--faint); font-style: italic; }
+
+/* Variables: fields, left-over values, page tables */
+.var .twisty { width: 16px; flex: none; cursor: pointer; }
+.var.field .vname { padding-left: 14px; }
+.var.unset .vval { opacity: 0.5; }
+.var .vunset { color: var(--faint); font-style: italic; margin-left: 6px; }
+.var .vtable { margin-left: 6px; }
+
+/* Changes: rows on what the call slept on */
+.ch-row.on-chan { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.ch-row .chan-tag { color: var(--accent); width: 16px; flex: none; }
+
+/* History: recordings of shells replaced earlier */
+.history-sub { padding: 8px 12px 2px; font-size: 11px; text-transform: uppercase; color: var(--faint); letter-spacing: 0.04em; }
+
+.asm-mem .mem-val, .asm-mem .mem-name { overflow-wrap: anywhere; }
+.asm-cpu .cpu-line .v { min-width: 0; }

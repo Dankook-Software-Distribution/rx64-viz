@@ -36,8 +36,10 @@ public record RxvizProperties(
     /**
      * A kernel-only virtual address range and what it is (kind: ram,
      * device, trampoline, trapframe, cpuentry, ...). The first match wins.
+     * pa (optional): the physical address va maps to, when it is fixed (a
+     * device's registers).
      */
-    public record Region(String va, String size, String kind, String label) {
+    public record Region(String va, String size, String kind, String label, String pa) {
     }
 
     /** Per-CPU stacks in the kernel image: symbol, divided into slices of size bytes (CPU 0 first). */

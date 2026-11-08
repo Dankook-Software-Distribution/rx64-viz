@@ -180,7 +180,9 @@ export function toolbar(host: HTMLElement, actions: { resetLayout(): void; toggl
 
   window.addEventListener("keydown", (ev) => {
     const t = ev.target as HTMLElement;
-    if (t.closest("input, textarea, .xterm")) return;
+    /* typing (the step box, the console): only the F-keys still step; the
+     * console never sends them to the guest (console.ts) */
+    if (t.closest("input, textarea, .xterm") && ev.key !== "F10" && ev.key !== "F11") return;
     if (ev.key === "F10" && (ev.ctrlKey || ev.metaKey)) {
       ev.preventDefault();
       const target = runTarget.value;
@@ -224,8 +226,17 @@ export function statusbar(host: HTMLElement) {
     const run = s.path[0]?.label ?? "";
     if (run && run !== c.rec.title) item(run);
     item(`${ring(s.cpl)} mode`);
+    if (s.mode) {
+      const m = item(s.mode, s.mode.startsWith("64") ? "" : "warn");
+      m.title = "The CPU's mode: CR0.PE, EFER.LMA, and whether the code is the kernel's 32-bit entry code";
+    }
     if (s.location.file) item(`${s.location.file}:${s.location.line}`);
     item(s.location.label, "mono");
     if (s.registers.cr3) item(`cr3 ${hex(s.registers.cr3)}`, "mono");
+    if (c.note) {
+      const n = item("");
+      n.append(el("span", "codicon codicon-debug-step-over"), document.createTextNode(` ${c.note}`));
+      n.title = "The move went over other threads' runs: they ran between the two positions";
+    }
   });
 }

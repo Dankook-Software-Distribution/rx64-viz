@@ -46,7 +46,7 @@ export class StoresPanel extends Panel {
       const r = el("button", "store" + (w.step === s.step - 1 ? " changed" : ""));
       r.append(
         el("span", "", grouped(w.step)),
-        el("span", "", hex(w.pa)),
+        addrCell(w.pa, w.name),
         el("span", "", String(w.size)),
         el("span", "dim", hex(w.old)),
         el("span", "", hex(w.value)),
@@ -59,4 +59,13 @@ export class StoresPanel extends Panel {
     });
     this.body.replaceChildren(head, ...rows);
   }
+}
+
+function addrCell(pa: string, name: string | null): HTMLElement {
+  const c = el("span", "st-addr", hex(pa));
+  if (name) {
+    c.append(el("span", "st-name", ` ${name}`));
+    c.title = `${hex(pa)}: ${name} (a kernel global, named from its symbol and DWARF type)`;
+  }
+  return c;
 }

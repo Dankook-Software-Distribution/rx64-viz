@@ -13,6 +13,8 @@ import rxviz.elf.LineTable;
  * stepping over a call that sleeps lands where the call returns.
  *
  *   over       next step in this frame (or a caller), skipping calls/traps
+ *              and the rest of a rep string instruction; a call that
+ *              never returns in the recording is stepped into
  *   out        first step after the current frame returns
  *   line-into  first step on another source line
  *   line-over  like over, but also on another source line
@@ -23,10 +25,13 @@ import rxviz.elf.LineTable;
  *   run-to     next (or previous) time a given source line starts, in any
  *              thread: the recording's own order of time
  *
- * With the step filter, line-into and line-back do not stop inside the
- * kernel's lock helpers (KernelProfile.stepSkip): a call to one is gone
- * over as a whole, unless the scan started inside it. Traps taken inside
- * one are still stopped in.
+ * With the step filter, line-into does not stop inside the kernel's
+ * lock helpers (KernelProfile.stepSkip): a call to one is gone over as a
+ * whole, unless the scan started inside it. Traps taken inside one are
+ * still stopped in. Trap stubs and swtch are not skipped: stepping into
+ * a system call stops on vectors.S, alltraps, and so on, the way the CPU
+ * goes. line-back is line-over backwards: calls and traps are gone over
+ * as a whole, and from a function's first line it goes to its caller's.
  */
 public final class Stepper {
 
@@ -83,7 +88,14 @@ public final class Stepper {
         return n < 0 ? 0 : t.depth(n);
     }
 
-    /** First step after s, in s's thread, at depth < maxDepth, or at maxDepth where stop holds. */
+    /** forward(): the thread never gets there in the recording (a call that does not return). */
+    private static final int NEVER = -2;
+
+    /**
+     * First step after s, in s's thread, at depth < maxDepth, or at
+     * maxDepth where stop holds; NEVER if the recording (or the scan
+     * limit) ends first.
+     */
     private int forward(int s, int maxDepth, IntPredicate stop) {
         int run = t.rootAt(s);
         if (run < 0)
@@ -93,7 +105,7 @@ public final class Stepper {
             if (step >= t.end(run)) {
                 run = t.nextRunOfThread(run);
                 if (run < 0)
-                    return last;
+                    return NEVER;
                 step = t.start(run);
             }
             int m = t.innermost(step);
@@ -108,7 +120,7 @@ public final class Stepper {
                 return step;
             step++;
         }
-        return Math.min(step, last);
+        return NEVER;
     }
 
     /**
@@ -141,29 +153,65 @@ public final class Stepper {
         return Math.max(step + 1, 0);
     }
 
+    /**
+     * Over one instruction; a rep-prefixed string instruction (rep stosb)
+     * as a whole, though the CPU runs, and the trace records, each of its
+     * iterations as a step. A call that never returns in the recording
+     * (call main) is stepped into instead.
+     */
     public int over(int s) {
-        return forward(s, depthAt(s), x -> true);
+        long pc = r.insn(s).vaddr();
+        boolean rep = repString(r.insn(s).bytes());
+        int to = forward(s, depthAt(s), x -> !rep || r.insn(x).vaddr() != pc);
+        return to == NEVER ? Math.min(s + 1, last) : to;
     }
 
+    /**
+     * A step that starts another line after one on line key0. Code with no
+     * line (riscv-style's trampoline) is a line per instruction, so line
+     * stepping walks through it instead of jumping over it.
+     */
+    private static boolean newLine(int key0, int k) {
+        return k != key0 || k < 0;
+    }
+
+    /** Over a source line; a call in it that never returns is stepped into. */
     public int lineOver(int s) {
         int key0 = key(s);
-        return forward(s, depthAt(s), x -> {
-            int k = key(x);
-            return k >= 0 && k != key0;
-        });
+        int to = forward(s, depthAt(s), x -> newLine(key0, key(x)));
+        return to == NEVER ? lineInto(s) : to;
     }
 
+    /** -1 if the current function never returns in the recording. */
     public int out(int s) {
         int d = depthAt(s);
-        return d <= 1 ? s : forward(s, d - 1, x -> true);
+        if (d <= 1)
+            return -1; /* the thread's outermost frame: nothing to return to */
+        int to = forward(s, d - 1, x -> true);
+        return to == NEVER ? -1 : to;
     }
 
-    /** loop-out: -1 if s is not in a loop. */
+    /** loop-out: -1 if s is not in a loop (or the loop never ends in the recording). */
     public int loopOut(int s) {
         long[] loop = r.loopAround(s);
         if (loop == null)
             return -1;
-        return forward(s, depthAt(s), x -> !inside(x, loop));
+        int to = forward(s, depthAt(s), x -> !inside(x, loop));
+        return to == NEVER ? -1 : to;
+    }
+
+    /** rep / repne + a string instruction (movs, cmps, stos, lods, scas). */
+    static boolean repString(byte[] b) {
+        int i = InsnKind.prefixEnd(b);
+        boolean rep = false;
+        for (int k = 0; k < i; k++)
+            rep |= (b[k] & 0xff) == 0xf2 || (b[k] & 0xff) == 0xf3;
+        if (i < b.length && (b[i] & 0xf0) == 0x40)
+            i++; /* REX */
+        if (!rep || i >= b.length)
+            return false;
+        int op = b[i] & 0xff;
+        return op >= 0xa4 && op <= 0xaf && op != 0xa8 && op != 0xa9;
     }
 
     /** loop-back: -1 if s is not in a loop. */
@@ -216,9 +264,10 @@ public final class Stepper {
         return step;
     }
 
+    /** First step after s on another line (filtered: not inside a skipped helper). */
     public int lineInto(int s) {
-        int run = t.rootAt(s);
         int key0 = key(s);
+        int run = t.rootAt(s);
         int step = s + 1;
         for (int n = 0; n < LIMIT && step <= last; n++) {
             if (run >= 0 && step >= t.end(run)) {
@@ -232,40 +281,75 @@ public final class Stepper {
                 step = Math.max(step + 1, t.end(f));
                 continue;
             }
-            int k = key(step);
-            if (k >= 0 && k != key0)
+            if (newLine(key0, key(step)))
                 return step;
             step++;
         }
         return Math.min(step, last);
     }
 
+    /**
+     * The start of the previous source line in this frame, going over calls
+     * and traps as wholes (line-over backwards); from a function's first
+     * line, the start of the caller's line that called it.
+     */
     public int lineBack(int s) {
         int run = t.rootAt(s);
+        int d = depthAt(s);
         int key0 = key(s);
         int step = s - 1;
-        int k1 = -1;
+        int k1 = -1, at = -1;
         for (int n = 0; n < LIMIT && step >= 0; n++) {
             if (run >= 0 && step < t.start(run)) {
                 run = t.prevRunOfThread(run);
                 if (run < 0)
-                    return Math.max(step + 1, 0);
+                    break;
                 step = t.end(run) - 1;
             }
-            int f = skipped(step, s);
-            if (f >= 0) {
-                step = Math.min(step - 1, t.start(f) - 1);
+            int m = t.innermost(step);
+            int dd = m < 0 ? 0 : t.depth(m);
+            if (dd > d) {
+                /* inside a call or trap: back over all of it */
+                int c = t.ancestorAtDepth(m, d + 1);
+                step = Math.min(step - 1, t.start(c) - 1);
+                continue;
+            }
+            if (dd < d) {
+                if (k1 >= 0)
+                    return at;
+                /* left the function from its first line: the caller's line */
+                d = dd;
+                k1 = key(step);
+                at = step;
+                if (k1 < 0)
+                    return at; /* a caller with no line: its instruction */
+                step--;
                 continue;
             }
             int k = key(step);
-            if (k1 < 0) {
-                if (k >= 0 && k != key0)
-                    k1 = k;
-            } else if (k != k1) {
-                return step + 1;
+            if (k < 0) {
+                /* code with no line: one instruction is one line */
+                return k1 < 0 ? step : at;
+            }
+            if (key0 < 0) {
+                /* from such code back into a line: found it, now its start */
+                k1 = k;
+                at = step;
+                key0 = k;
+            } else {
+                if (k1 < 0) {
+                    if (k != key0) {
+                        k1 = k;
+                        at = step;
+                    }
+                } else if (k == k1) {
+                    at = step;
+                } else {
+                    return at;
+                }
             }
             step--;
         }
-        return Math.max(step + 1, 0);
+        return at >= 0 ? at : Math.max(step + 1, 0);
     }
 }

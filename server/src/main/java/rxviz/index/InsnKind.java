@@ -4,10 +4,9 @@ package rxviz.index;
 public enum InsnKind {
     OTHER, CALL, RET, IRET, SYSRET, JMP_INDIRECT, INT;
 
-    public static InsnKind of(byte[] b) {
+    /** The index of the first byte after the legacy prefixes (operand/address size, lock, rep, segments). */
+    static int prefixEnd(byte[] b) {
         int i = 0;
-        boolean rexW = false;
-        /* legacy prefixes, then an optional REX prefix */
         while (i < b.length) {
             int p = b[i] & 0xff;
             if (p == 0x66 || p == 0x67 || p == 0xf0 || p == 0xf2 || p == 0xf3
@@ -17,6 +16,13 @@ public enum InsnKind {
             else
                 break;
         }
+        return i;
+    }
+
+    public static InsnKind of(byte[] b) {
+        boolean rexW = false;
+        /* legacy prefixes, then an optional REX prefix */
+        int i = prefixEnd(b);
         if (i < b.length && (b[i] & 0xf0) == 0x40) {
             rexW = (b[i] & 0x08) != 0;
             i++;

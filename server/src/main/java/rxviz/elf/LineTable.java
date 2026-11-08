@@ -3,6 +3,7 @@ package rxviz.elf;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -46,6 +47,10 @@ public final class LineTable {
             this.root = root;
         }
 
+        Path path(String rel) {
+            return root.resolve(rel);
+        }
+
         /** The table header names the file with its directory when it is that row's file. */
         String resolve(String header, String base) {
             if (header != null) {
@@ -61,6 +66,9 @@ public final class LineTable {
     private static final Pattern HEADER = Pattern.compile("^(?:CU: )?(\\S.*):$");
     private static final Pattern ROW =
             Pattern.compile("^(\\S+)\\s+(\\d+)\\s+(0x[0-9a-f]+|0)(?:\\s+\\d+)?(?:\\s+x)?\\s*$");
+    /* the end of a sequence: the addresses from here on have no line (until the next row) */
+    private static final Pattern END_ROW = Pattern.compile("^(\\S+)\\s+-\\s+(0x[0-9a-f]+)\\s*$");
+    private static final Src END = new Src("", 0);
 
     /* unsigned address order: kernel addresses are negative longs */
     private final NavigableMap<Long, Src> rows = new TreeMap<>(Long::compareUnsigned);
@@ -76,6 +84,12 @@ public final class LineTable {
             Matcher h = HEADER.matcher(line);
             if (h.matches() && !line.startsWith("Contents")) {
                 header[0] = h.group(1);
+                return;
+            }
+            Matcher end = END_ROW.matcher(line);
+            if (end.matches()) {
+                /* over its own sequence's last (empty) row; a next sequence's first row comes later and wins */
+                t.rows.put(Long.parseUnsignedLong(end.group(2).substring(2), 16), END);
                 return;
             }
             Matcher m = ROW.matcher(line);
@@ -99,14 +113,60 @@ public final class LineTable {
     public NavigableSet<Integer> linesOf(String file) {
         TreeSet<Integer> out = new TreeSet<>();
         for (Src s : rows.values())
-            if (s.file().equals(file))
+            if (s != END && s.file().equals(file))
                 out.add(s.line());
         return out;
     }
 
-    /** The row covering addr, or null. */
+    /**
+     * Address ranges [from, to) of code assembled for 32-bit mode: rows
+     * of .S files on lines between a .code32 and the next .code64 (the
+     * kernels' entry code, which runs before long mode is on).
+     */
+    public List<long[]> code32(SourceTree tree) {
+        Map<String, boolean[]> modes = new HashMap<>();
+        List<long[]> out = new ArrayList<>();
+        long from = -1;
+        for (Map.Entry<Long, Src> e : rows.entrySet()) {
+            Src s = e.getValue();
+            boolean in32 = false;
+            if (s != END && s.file().endsWith(".S")) {
+                boolean[] m = modes.computeIfAbsent(s.file(), f -> modesOf(tree.path(f)));
+                in32 = s.line() < m.length && m[s.line()];
+            }
+            if (in32 && from == -1)
+                from = e.getKey();
+            else if (!in32 && from != -1) {
+                out.add(new long[] {from, e.getKey()});
+                from = -1;
+            }
+        }
+        return out;
+    }
+
+    /** Per line (1-based): whether it is in a .code32 part of the file. */
+    private static boolean[] modesOf(Path file) {
+        try {
+            List<String> lines = Files.readAllLines(file);
+            boolean[] m = new boolean[lines.size() + 1];
+            boolean in32 = false;
+            for (int i = 0; i < lines.size(); i++) {
+                String l = lines.get(i).trim();
+                if (l.startsWith(".code32"))
+                    in32 = true;
+                else if (l.startsWith(".code64"))
+                    in32 = false;
+                m[i + 1] = in32;
+            }
+            return m;
+        } catch (IOException e) {
+            return new boolean[0];
+        }
+    }
+
+    /** The row covering addr, or null (also past the end of a sequence: code without line info). */
     public Src at(long addr) {
         Map.Entry<Long, Src> e = rows.floorEntry(addr);
-        return e == null ? null : e.getValue();
+        return e == null || e.getValue() == END ? null : e.getValue();
     }
 }

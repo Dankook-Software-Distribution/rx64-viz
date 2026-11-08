@@ -2,7 +2,7 @@
 // in the Console, newest last. Clicking one opens it everywhere.
 
 import type { BootInfo, RecInfo } from "../api";
-import { cursor } from "../cursor";
+import { cursor, showPanel } from "../cursor";
 import { count, grouped } from "../format";
 import { shell } from "../shell";
 import { el, note, Panel } from "./panel";
@@ -40,7 +40,7 @@ export class HistoryPanel extends Panel {
   }
 
   private render() {
-    const { kernels, shell: sh, kernel, error } = shell.value;
+    const { kernels, shell: sh, past, kernel, error } = shell.value;
     this.body.replaceChildren();
     if (error) this.body.append(note(error, "error"));
     const k = kernels.find((x) => x.id === kernel);
@@ -53,6 +53,22 @@ export class HistoryPanel extends Panel {
     for (const r of recs) this.body.append(this.row(k.id, recItem(r)));
     if (!recs.length)
       this.body.append(el("div", "hint", "Type a command in the Console. Each one you run is recorded here."));
+    /* earlier shells (replaced, their guests stopped): their recordings still open */
+    const old = past.filter((p) => p.recordings.some((r) => r.status === "ready"));
+    if (old.length) {
+      const h = el("div", "history-sub", "Earlier shells");
+      h.title = "Shells that were replaced (their xv6 stopped): what they recorded can still be opened";
+      this.body.append(h);
+      for (const p of old) {
+        const ko = p.kernel === k.id ? "" : ` · ${p.kernel}`;
+        for (const r of p.recordings)
+          if (r.status === "ready") {
+            const it = recItem(r);
+            it.title = r.command + ko;
+            this.body.append(this.row(p.kernel, it));
+          }
+      }
+    }
   }
 
   private row(kernel: string, it: Item): HTMLElement {
@@ -63,7 +79,14 @@ export class HistoryPanel extends Panel {
     row.disabled = steps === null;
     row.title = steps === null ? it.hint : `${it.hint} (${grouped(steps)} instructions)`;
     if (steps !== null)
-      row.onclick = () => void cursor.open({ id: it.id, kernel, title: it.title, steps, start: it.start });
+      row.onclick = () => {
+        void cursor.open({ id: it.id, kernel, title: it.title, steps, start: it.start });
+        /* a boot has its system calls only at the very end: start from main()'s calls and the milestones */
+        if (it.id.startsWith("boot-")) {
+          showPanel("events");
+          showPanel("timeline");
+        }
+      };
     return row;
   }
 }

@@ -27,6 +27,8 @@ public final class Recording {
         private final long vaddr;
         private final byte[] bytes;
         private final InsnKind kind;
+        /* CpuTables.LGDT / LIDT, or 0 */
+        final byte table;
         /* function name, valid for fnOf (the kernel profile or a user Program) */
         Object fnOf;
         String fn;
@@ -35,6 +37,7 @@ public final class Recording {
             this.vaddr = vaddr;
             this.bytes = bytes;
             this.kind = InsnKind.of(bytes);
+            this.table = CpuTables.tableLoad(bytes);
         }
 
         public long vaddr() { return vaddr; }
@@ -51,6 +54,11 @@ public final class Recording {
     /** A store: step, physical address, size in bytes, the value written. */
     public interface StoreVisitor {
         void store(int step, long pa, int size, long value);
+    }
+
+    /** A store with the value it overwrote. */
+    public interface OldStoreVisitor {
+        void store(int step, long pa, int size, long value, long old);
     }
 
     /** Everything about one step, with its registers decoded once. */
@@ -82,6 +90,28 @@ public final class Recording {
     private final Summary summary;
     /* user-mode steps before each block of Timeline.BLOCK steps (prefix sums) */
     private final long[] userBefore;
+    /* steps that run lgdt / lidt, in order */
+    private final int[] gdtLoads, idtLoads;
+    private final int firstUser;
+    /* control-register changes, table loads, the first user step (Timeline) */
+    private final List<Timeline.Milestone> milestones;
+
+    private final int[] cr3Switches;
+    private final ProcStates procStates;
+
+    /** Steps of the instructions that loaded cr3 (every page-table switch), in order. */
+    int[] cr3Switches() {
+        return cr3Switches;
+    }
+
+    /** Every change of a proc[k].state, recorded while indexing. */
+    ProcStates procStates() {
+        return procStates;
+    }
+
+    public List<Timeline.Milestone> milestones() {
+        return milestones;
+    }
 
     private MemoryImage image;
     private int imageStep;
@@ -101,7 +131,14 @@ public final class Recording {
     Recording(String id, String command, KernelProfile kernel, String[] regNames,
               int steps, Insns insns, ChunkStore chunks, Checkpoints ckpts, Tree tree,
               Programs programs, int memSize, MemoryImage finalImage, short[] userBlocks,
-              Summary summary) {
+              int[] gdtLoads, int[] idtLoads, int firstUser, Summary summary,
+              List<Timeline.Milestone> milestones, int[] cr3Switches, ProcStates procStates) {
+        this.firstUser = firstUser;
+        this.cr3Switches = cr3Switches;
+        this.procStates = procStates;
+        this.milestones = List.copyOf(milestones);
+        this.gdtLoads = gdtLoads;
+        this.idtLoads = idtLoads;
         this.id = id;
         this.command = command;
         this.kernel = kernel;
@@ -153,6 +190,19 @@ public final class Recording {
         check(step);
         ChunkStore.Decoded d = chunks.chunkOf(step);
         return insns.get(d.insn[step - d.base]);
+    }
+
+    /** The names of the registers the instruction before step wrote. */
+    public List<String> written(int step) {
+        check(step);
+        List<String> out = new ArrayList<>();
+        if (step == 0)
+            return out;
+        int m = chunks.chunkOf(step).written(step);
+        for (int i = 0; i < regNames.length; i++)
+            if ((m & (1 << i)) != 0)
+                out.add(regNames[i]);
+        return out;
     }
 
     /** Registers at step (the last step's for step == steps), without locating the instruction. */
@@ -232,28 +282,149 @@ public final class Recording {
         return programs.at(cr3, step);
     }
 
-    private AddressSpace space; /* the last step asked for */
+    /**
+     * The program whose code the address space with page-table root cr3
+     * holds at step: the one last seen running there if its code is still
+     * there, else the one whose code is (a page-table frame freed and
+     * reused, or a forked child that has not run yet); null if none.
+     */
+    public Program programIn(long cr3, int step) {
+        Program seen = programAt(cr3, step);
+        List<Program> all = new ArrayList<>();
+        if (seen != null)
+            all.add(seen);
+        all.addAll(kernel.programs());
+        return memory(step, img -> {
+            MemoryImage.Virtual vm = img.virtual(cr3, true);
+            for (Program p : all) {
+                for (var seg : p.elf().segments()) {
+                    if (!seg.executable() || seg.filesz() < 32)
+                        continue;
+                    byte[] b = vm.bytes(seg.vaddr(), 32);
+                    if (b.length == 32 && p.elf().matches(seg.vaddr(), b))
+                        return p;
+                    break;
+                }
+            }
+            return null;
+        });
+    }
 
-    private synchronized AddressSpace space(int step) {
+    private AddressSpace space; /* the last one asked for */
+
+    /**
+     * The page-table root (physical) a request names: proc[slot]'s table
+     * (slot >= 0), a table by its root (root >= 0: exec's new one, held by
+     * a local variable), or -1: CR3's.
+     */
+    public long root(int step, int slot, long root) {
         check(step);
-        if (space == null || space.step != step)
-            space = new AddressSpace(this, step);
+        if (root >= 0)
+            return root & MemoryImage.ADDR_MASK;
+        if (slot < 0)
+            return -1;
+        long pt = procs().pageTable(step, slot);
+        if (pt < 0)
+            throw new IllegalArgumentException("proc[" + slot + "] has no page table at step " + step);
+        return pt;
+    }
+
+    /** root < 0: CR3's address space; else the page table at root (see root()). */
+    private synchronized AddressSpace space(int step, long root) {
+        check(step);
+        if (space == null || space.step != step || space.root != root)
+            space = new AddressSpace(this, step, root);
         return space;
     }
 
-    /** The address space of CR3 at step, as regions (see AddressSpace). */
-    public AddressSpace.Layout addressSpace(int step) {
-        return space(step).map();
+    /** A map that keeps the n most recently used entries. */
+    static <K, V> Map<K, V> lru(int n) {
+        return new LinkedHashMap<>(n, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<K, V> e) {
+                return size() > n;
+            }
+        };
     }
 
-    /** How every physical frame is used at step (see AddressSpace). */
-    public AddressSpace.PhysMap physMap(int step) {
-        return space(step).physMap();
+    private final Map<Integer, PageTables> pageTables = lru(4);
+
+    /**
+     * Whose page table root is at step: "kernel_pagetable", "proc[2] pid
+     * 3 sh", or null. Only the roots are compared (kernel_pagetable and
+     * every p->pagetable); no table is walked.
+     */
+    public synchronized String tableOwner(int step, long root) {
+        long r0 = root & MemoryImage.ADDR_MASK;
+        long kva = kernel.kernelElf().addressOf("kernel_pagetable");
+        long kpa = kva == -1 ? -1 : kernel.kernelElf().physOf(kva);
+        Long k = kpa < 0 ? null : memory(step, img -> img.contains(kpa, 8) ? img.read(kpa, 8) : null);
+        if (k != null && k != 0 && toPhys(k) == r0)
+            return "kernel_pagetable";
+        try {
+            for (Processes.Proc p : processes(step).procs()) {
+                long v = Processes.unhex(p.pagetable());
+                if (v != 0 && toPhys(v) == r0)
+                    return "proc[" + p.slot() + "] pid " + p.pid() + (p.name().isEmpty() ? "" : " " + p.name());
+            }
+        } catch (RuntimeException e) {
+            /* no process table yet */
+        }
+        return null;
     }
 
-    /** One physical frame at step: its kind and where CR3's page table maps it. */
-    public AddressSpace.Frame frame(int step, long pa) {
-        return space(step).frame(pa);
+    /** A kernel pointer's physical address (the direct map; identity-mapped kernels: itself). */
+    long toPhys(long kva) {
+        long pa = kernel.directMapToPhys(kva);
+        return pa >= 0 ? pa : kva;
+    }
+
+    /** Every page-table page at step and whose it is (see PageTables). */
+    public synchronized PageTables pageTables(int step) {
+        check(step);
+        PageTables pt = pageTables.get(step);
+        if (pt != null)
+            return pt;
+        List<Processes.Proc> procs;
+        try {
+            procs = paging(step) ? processes(step).procs() : List.of();
+        } catch (RuntimeException e) {
+            procs = List.of(); /* no process table yet (early boot) */
+        }
+        long cr3 = paging(step) ? cr3(step) : 0;
+        List<Processes.Proc> ps = procs;
+        pt = memory(step, img -> new PageTables(kernel, img, ps, cr3));
+        pageTables.put(step, pt);
+        return pt;
+    }
+
+    /** The address space of CR3 (root < 0) or of the page table at root at step, as regions (see AddressSpace). */
+    public AddressSpace.Layout addressSpace(int step, long root) {
+        AddressSpace.Layout l = space(step, root).map();
+        if (!l.paging())
+            return l;
+        /* the process this page table belongs to: its p->sz */
+        long table = l.cr3() & MemoryImage.ADDR_MASK;
+        try {
+            for (Processes.Proc p : processes(step).procs()) {
+                long v = Processes.unhex(p.pagetable());
+                if (v != 0 && toPhys(v) == table)
+                    return l.withSz(p.sz());
+            }
+        } catch (RuntimeException e) {
+            /* no process table (early boot): no p->sz */
+        }
+        return l;
+    }
+
+    /** How every physical frame is used at step, seen from that address space (see AddressSpace). */
+    public AddressSpace.PhysMap physMap(int step, long root) {
+        return space(step, root).physMap();
+    }
+
+    /** One physical frame at step: its kind and where that address space maps it. */
+    public AddressSpace.Frame frame(int step, long pa, long root) {
+        return space(step, root).frame(pa);
     }
 
     /**
@@ -277,7 +448,60 @@ public final class Recording {
         return Timeline.of(this, from, to, buckets);
     }
 
+    /** Stores to one trap frame: {store step, pa >>> 3} in step order, scanned up to `to`. */
+    private record FrameStores(java.util.Set<Long> pas, List<int[]> stores, int[] to) {
+    }
+
+    private final Map<Integer, FrameStores> frameStores = new LinkedHashMap<>(8, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<Integer, FrameStores> e) {
+            return size() > 8;
+        }
+    };
+
+    /**
+     * The stores to the 8-byte words at pas (a trap frame) from the trap's
+     * start up to `to`, as {step, pa >>> 3}: scanned once per trap and
+     * extended as the cursor moves on (StackView's writers).
+     */
+    synchronized List<int[]> trapFrameStores(int trapStep, java.util.Set<Long> pas, int to) {
+        FrameStores f = frameStores.get(trapStep);
+        if (f == null || !f.pas().equals(pas)) {
+            f = new FrameStores(java.util.Set.copyOf(pas), new ArrayList<>(), new int[] {Math.max(0, trapStep - 1)});
+            frameStores.put(trapStep, f);
+        }
+        if (to > f.to()[0]) {
+            FrameStores g = f;
+            scanStores(f.to()[0], to, (st, pa, size, value) -> {
+                if (g.pas().contains(pa & ~7L))
+                    g.stores().add(new int[] {st, (int) (pa >>> 3)});
+            });
+            f.to()[0] = to;
+        }
+        return f.stores();
+    }
+
+    /** The first store in [from, to) that overlaps [pa, pa + len), or -1 (the scan stops there). */
+    public int firstStore(int from, int to, long pa, int len) {
+        int[] at = {-1};
+        chunks.forEachWrite(Math.max(0, from), Math.min(to, steps), false, (s, spa, size, nv, ov) -> {
+            if (spa < pa + len && spa + size > pa) {
+                at[0] = s;
+                return false;
+            }
+            return true;
+        });
+        return at[0];
+    }
+
     /** Every store made by steps in [from, to), oldest first. */
+    public void scanStores(int from, int to, OldStoreVisitor v) {
+        chunks.forEachWrite(Math.max(0, from), Math.min(to, steps), false, (s, pa, size, nv, ov) -> {
+            v.store(s, pa, size, nv, ov);
+            return true;
+        });
+    }
+
     public void scanStores(int from, int to, StoreVisitor v) {
         chunks.forEachWrite(Math.max(0, from), Math.min(to, steps), false, (s, pa, size, nv, ov) -> {
             v.store(s, pa, size, nv);
@@ -302,10 +526,207 @@ public final class Recording {
         return c == null ? null : c.detail();
     }
 
-    /** The stack in use at step, slot by slot (see StackView). */
-    public StackView.Stack stack(int step) {
+    private Processes processes;
+
+    synchronized Processes procs() {
+        if (processes == null)
+            processes = new Processes(this);
+        return processes;
+    }
+
+    private final Map<Integer, Processes.View> procViews = lru(4);
+
+    /** The process table at step (see Processes); the last few are kept (Memory, Names, Processes ask for the same step). */
+    public Processes.View processes(int step) {
+        if (step < 0 || step > steps)
+            throw new IllegalArgumentException("step " + step);
+        synchronized (procViews) {
+            Processes.View v = procViews.get(step);
+            if (v != null)
+                return v;
+        }
+        Processes.View v = procs().view(step);
+        synchronized (procViews) {
+            procViews.put(step, v);
+        }
+        return v;
+    }
+
+    private final Map<Long, StateDiff.Diff> diffs = new LinkedHashMap<>(8, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<Long, StateDiff.Diff> e) {
+            return size() > 16;
+        }
+    };
+
+    /** What changed from step from to step to (see StateDiff). */
+    public StateDiff.Diff diff(int from, int to) {
+        if (from < 0 || to > steps || from > to)
+            throw new IllegalArgumentException("need 0 <= from <= to <= " + steps);
+        long key = ((long) from << 32) | to;
+        synchronized (diffs) {
+            StateDiff.Diff d = diffs.get(key);
+            if (d != null)
+                return d;
+        }
+        StateDiff.Diff d = new StateDiff(this, procs()).diff(from, to);
+        synchronized (diffs) {
+            diffs.put(key, d);
+        }
+        return d;
+    }
+
+    /** Steps that run lgdt (CpuTables.LGDT) or lidt (LIDT), in order. Do not modify. */
+    int[] tableLoads(byte kind) {
+        return kind == CpuTables.LGDT ? gdtLoads : idtLoads;
+    }
+
+    /** The first user-mode step, or -1 if none. */
+    int firstUserStep() {
+        return firstUser;
+    }
+
+    private CpuTables cpuTables;
+
+    synchronized CpuTables cpuTables() {
+        if (cpuTables == null)
+            cpuTables = new CpuTables(this);
+        return cpuTables;
+    }
+
+    /**
+     * Why threads took turns (a folded run of runs): what each process in
+     * it waited on when it was switched out the first time, from proc[]
+     * then ("proc[0] pid 1 init sleeps on bcache.buf[24]"); null if none slept.
+     */
+    public String turnsDetail(List<Integer> runs) {
+        java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
+        java.util.Set<Integer> seen = new java.util.HashSet<>();
+        for (int run : runs) {
+            int slot = tree.slotOf(run);
+            if (slot < 0 || !seen.add(slot) || out.size() >= 3)
+                continue;
+            int at = Math.min(tree.end(run), steps - 1);
+            /* only a sleeper says why: its state from the stores, then its chan from memory */
+            Map<Long, String> names = kernel.structs().enumWith("SLEEPING");
+            if (names == null || !"SLEEPING".equals(names.get((long) procStates.at(slot, at))))
+                continue;
+            try {
+                for (Processes.Proc p : processes(at).procs())
+                    if (p.slot() == slot && p.state().equals("SLEEPING"))
+                        out.add(tree.processOf(run) + (p.name().isEmpty() ? "" : " " + p.name()) + " sleeps on "
+                                + (p.chanName() != null ? p.chanName() : p.chan()));
+            } catch (RuntimeException e) {
+                /* no process table to read */
+            }
+        }
+        return out.isEmpty() ? null : String.join("; ", out);
+    }
+
+    /** The GDT, TSS and IDT at step (see CpuTables). */
+    public CpuTables.View cpu(int step) {
         check(step);
-        return new StackView(this).at(step);
+        return cpuTables().view(step);
+    }
+
+    private static final Map<String, Recording> boots = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Make r the boot recording of its kernel (CpuTables takes once-loaded tables from it). */
+    public static void registerBoot(Recording r) {
+        boots.put(r.kernel().id(), r);
+    }
+
+    static Recording bootOf(String kernelId) {
+        return boots.get(kernelId);
+    }
+
+    /**
+     * Who runs at step, named the same everywhere: "proc[4] pid 7 grep"
+     * (the thread's process, the program its address space holds then),
+     * or the run's label (scheduler, boot).
+     */
+    public String threadLabel(int step) {
+        int root = tree.rootAt(step);
+        String run = root < 0 ? null : tree.label(root);
+        String slot = root < 0 ? null : tree.processOf(root);
+        if (slot == null)
+            return run;
+        Program p = programAt(cr3(step), step);
+        if (p != null)
+            return slot + " " + p.name();
+        int arrow = run.lastIndexOf('\u2192');
+        return arrow < 0 ? run : slot + " " + run.substring(arrow + 1);
+    }
+
+    /**
+     * The threads other than the one at from that ran between from and to
+     * (forward moves only), by label, in order of first run; at most 6.
+     */
+    public List<String> othersBetween(int from, int to) {
+        if (to <= from + 1)
+            return List.of();
+        int a = tree.rootAt(from);
+        if (a < 0 || tree.end(a) >= to)
+            return List.of();
+        int me = tree.thread(a);
+        java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
+        int[] runs = tree.runs();
+        /* runs are in start order: from the one at `from` until `to` */
+        for (int i = Arrays.binarySearch(runs, a) + 1; i < runs.length && tree.start(runs[i]) < to; i++) {
+            if (tree.thread(runs[i]) != me)
+                out.add(tree.label(runs[i]));
+            if (out.size() >= 6)
+                break;
+        }
+        return List.copyOf(out);
+    }
+
+    /**
+     * The CPU's mode at step: real (CR0.PE off), protected 32-bit, or with
+     * long mode on (EFER.LMA) 64-bit, unless the code is the kernel's
+     * .code32 entry code (then compatibility mode: cs still holds a 32-bit
+     * segment until the far jump).
+     */
+    public String cpuMode(View v) {
+        int cr0 = regIndex("cr0");
+        if (cr0 >= 0 && (v.regs()[cr0] & 1) == 0)
+            return "real mode";
+        boolean c32 = v.cpl() == 0 && kernel.isCode32(v.insn().vaddr());
+        if (!CpuTables.long64(v.regs(), this))
+            return "protected mode, 32-bit";
+        return c32 ? "compatibility mode (long mode on, 32-bit code)" : "64-bit mode";
+    }
+
+    /** The running function's parameters and locals at step, with their values (see Variables). */
+    public Variables.View variables(int step) {
+        check(step);
+        return Variables.at(this, step);
+    }
+
+    /** What addresses in the registers and the instruction at step are (see Names). */
+    public Names.View names(int step, boolean line) {
+        check(step);
+        return Names.at(this, step, line);
+    }
+
+    private StackView.Stack lastStack, lastLabels; /* the last ones asked for */
+
+    /** The stack in use at step, slot by slot (see StackView), with who wrote each trap frame slot. */
+    public synchronized StackView.Stack stack(int step) {
+        check(step);
+        if (lastStack == null || lastStack.step() != step)
+            lastStack = new StackView(this).at(step, true);
+        return lastStack;
+    }
+
+    /** The same without the writers: for naming slots. */
+    synchronized StackView.Stack stackLabels(int step) {
+        check(step);
+        if (lastStack != null && lastStack.step() == step)
+            return lastStack;
+        if (lastLabels == null || lastLabels.step() != step)
+            lastLabels = new StackView(this).at(step, false);
+        return lastLabels;
     }
 
     /** The source line of a line key (see lineKeys), or null. */

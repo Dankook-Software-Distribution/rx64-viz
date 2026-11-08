@@ -11,6 +11,8 @@ import { store } from "./store";
 export interface ShellState {
   kernels: KernelInfo[];
   shell: SessionInfo | null;
+  /** shells replaced earlier (newest first): their recordings can still be opened */
+  past: SessionInfo[];
   /** kernel shown in the title bar (the shell's, or the one being booted) */
   kernel: string | null;
   booting: boolean;
@@ -21,7 +23,7 @@ const KERNEL_KEY = "rxviz.kernel";
 const POLL_MS = 2000;
 
 class Shell {
-  private s = store<ShellState>({ kernels: [], shell: null, kernel: null, booting: false, error: null });
+  private s = store<ShellState>({ kernels: [], shell: null, past: [], kernel: null, booting: false, error: null });
   private timer: number | undefined;
 
   get value() {
@@ -48,8 +50,8 @@ class Shell {
   async refresh() {
     window.clearTimeout(this.timer);
     try {
-      const [kernels, shell] = await Promise.all([api.kernels(), api.shell()]);
-      this.set({ kernels, shell, kernel: shell?.kernel ?? this.s.value.kernel, error: null });
+      const [kernels, shell, past] = await Promise.all([api.kernels(), api.shell(), api.pastShells()]);
+      this.set({ kernels, shell, past, kernel: shell?.kernel ?? this.s.value.kernel, error: null });
       const preparing = kernels.some((k) => k.boot.status !== "READY" && k.boot.status !== "FAILED");
       if (preparing) this.timer = window.setTimeout(() => void this.refresh(), POLL_MS);
     } catch (e) {
@@ -64,7 +66,8 @@ class Shell {
     save(KERNEL_KEY, k);
     try {
       const shell = await api.newShell(k);
-      this.set({ shell, booting: false });
+      const past = await api.pastShells().catch(() => this.s.value.past);
+      this.set({ shell, past, booting: false });
     } catch (e) {
       this.set({ booting: false, error: "Cannot start xv6: " + (e as Error).message });
     }

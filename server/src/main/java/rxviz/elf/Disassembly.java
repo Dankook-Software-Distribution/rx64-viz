@@ -34,6 +34,17 @@ public final class Disassembly {
         return d;
     }
 
+    /** Disassembles [from, to) again as 32-bit code (objdump -m i386), replacing the 64-bit text there. */
+    public void as32(ElfFile elf, long from, long to) throws IOException {
+        text.subMap(from, true, to, false).clear();
+        Objdump.run(elf.path(), line -> {
+            Matcher m = LINE.matcher(line);
+            if (m.matches())
+                text.put(Long.parseUnsignedLong(m.group(1), 16), tidy(m.group(2)));
+        }, "-d", "-w", "-m", "i386", "--start-address=0x" + Long.toHexString(from),
+                "--stop-address=0x" + Long.toHexString(to));
+    }
+
     /**
      * "mov    %rsp,%rbp" -> "mov\t%rsp,%rbp": mnemonic (with any prefix such
      * as "rep stos"), a tab, then the operands; drops objdump's "# 0x..."

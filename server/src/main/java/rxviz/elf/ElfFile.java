@@ -34,6 +34,8 @@ public final class ElfFile {
     private final long[] symAddr;
     private final Symbol[] syms;
     private final Map<String, Long> byName = new HashMap<>();
+    /* variables (STT_OBJECT with a size), by address */
+    private final List<Symbol> objects = new ArrayList<>();
     private final Map<String, Long> sizeByName = new HashMap<>();
 
     private ElfFile(String name, Path path, byte[] data) {
@@ -88,6 +90,8 @@ public final class ElfFile {
                    user programs start at address 0 */
                 if (type != 1)
                     list.add(new Symbol(n, value, symSize));
+                else if (symSize > 0)
+                    objects.add(new Symbol(n, value, symSize));
             }
         }
         /* by address; on ties prefer the one with a size (the C function) */
@@ -98,6 +102,7 @@ public final class ElfFile {
             if (uniq.isEmpty() || uniq.getLast().addr() != sym.addr())
                 uniq.add(sym);
         syms = uniq.toArray(Symbol[]::new);
+        objects.sort((x, y) -> Long.compareUnsigned(x.addr(), y.addr()));
         symAddr = Arrays.stream(syms).mapToLong(Symbol::addr).toArray();
     }
 
@@ -126,6 +131,22 @@ public final class ElfFile {
         if (i < 0)
             i = -i - 2;
         return i >= 0 ? syms[i] : null;
+    }
+
+    /** The data object (variable) that contains addr, or null. */
+    public Symbol objectAt(long addr) {
+        int lo = 0, hi = objects.size() - 1;
+        Symbol best = null;
+        while (lo <= hi) {
+            int mid = (lo + hi) >>> 1;
+            if (Long.compareUnsigned(objects.get(mid).addr(), addr) <= 0) {
+                best = objects.get(mid);
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return best != null && Addr.in(addr, best.addr(), best.size()) ? best : null;
     }
 
     /** End of the code of the symbol that starts at addr: the next symbol, or addr + size. */

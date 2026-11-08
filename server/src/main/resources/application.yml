@@ -34,9 +34,9 @@ rxviz:
       # (memlayout.h); the first match wins
       regions:
         - { va: "0xffffffff80000000", size: "0x8000000", kind: ram, label: "RAM at KERNBASE + pa (P2V)" }
-        - { va: "0xfffffffffec00000", size: "0x1000", kind: device, label: "IOAPIC (DEV2V)" }
-        - { va: "0xfffffffffee00000", size: "0x1000", kind: device, label: "LAPIC (DEV2V)" }
-        - { va: "0xffffffff00000000", size: "0x100000000", kind: device, label: "PCI device registers (DEV2V)" }
+        - { va: "0xfffffffffec00000", size: "0x1000", kind: device, label: "IOAPIC (DEV2V)", pa: "0xfec00000" }
+        - { va: "0xfffffffffee00000", size: "0x1000", kind: device, label: "LAPIC (DEV2V)", pa: "0xfee00000" }
+        - { va: "0xffffffff00000000", size: "0x100000000", kind: device, label: "PCI device registers (DEV2V)", pa: "0x0" }
       vectors:
         "32": timer interrupt
         "36": uart interrupt
@@ -64,9 +64,11 @@ rxviz:
         - { va: "0x7fffffffc000", size: "0x2000", kind: cpuentry, label: "CPUENTRY (GDT, TSS, IDT)" }
         - { va: "0x8000", size: "0x1000", kind: other, label: "APENTRY (other CPUs' first code)" }
         - { va: "0x0", size: "0x8000000", kind: ram, label: "RAM at its own address" }
-        - { va: "0xfec00000", size: "0x1000", kind: device, label: "IOAPIC" }
-        - { va: "0xfee00000", size: "0x1000", kind: device, label: "LAPIC" }
-        - { va: "0x8000000", size: "0xf8000000", kind: device, label: "PCI device registers" }
+        - { va: "0xfec00000", size: "0x1000", kind: device, label: "IOAPIC", pa: "0xfec00000" }
+        - { va: "0xfee00000", size: "0x1000", kind: device, label: "LAPIC", pa: "0xfee00000" }
+        # where the BIOS put the PCI devices' registers (BARs) on this machine;
+        # the rest above RAM holds nothing
+        - { va: "0xfe000000", size: "0xc00000", kind: device, label: "PCI device registers", pa: "0xfe000000" }
       vectors:
         "32": timer interrupt
         "36": uart interrupt

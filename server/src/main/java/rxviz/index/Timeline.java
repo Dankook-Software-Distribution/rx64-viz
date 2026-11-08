@@ -23,12 +23,34 @@ public final class Timeline {
     public record Lane(int thread, String label, int[] run, int[] user) {
     }
 
-    /** kind: syscall, interrupt, exception; label and step of the first of count in the bucket. */
+    /** kind: syscall, interrupt, exception, cr3 (a page-table switch); label and step of the first of count in the bucket. */
     public record Marker(int bucket, int step, String kind, String label, int count, int lane) {
     }
 
-    public record View(int from, int to, int buckets, List<Lane> lanes, List<Marker> markers) {
+    /**
+     * A point the CPU's setup changed, read from the registers: a control
+     * register's bits (cr0: +PG), a page table loaded into cr3, a
+     * descriptor table loaded (lgdt / lidt), the first user-mode step.
+     */
+    public record Milestone(int step, String label) {
     }
+
+    /**
+     * A stretch a process did not run, by the state its proc[] slot held
+     * (SLEEPING, RUNNABLE, ZOMBIE), from the kernel's stores to p->state.
+     */
+    public record Span(int lane, int from, int to, String state) {
+    }
+
+    /** A store that made a sleeping process RUNNABLE: by the thread in lane `by`, for the one in lane `lane`. */
+    public record Wake(int step, int by, int lane, String label) {
+    }
+
+    public record View(int from, int to, int buckets, List<Lane> lanes, List<Marker> markers,
+                       List<Milestone> milestones, List<Span> spans, List<Wake> wakes) {
+    }
+
+    private static final int MAX_SPANS = 20000;
 
     /* by KernelProfile.TrapKind ordinal */
     private static final String[] KINDS = {"syscall", "interrupt", "exception"};
@@ -48,10 +70,16 @@ public final class Timeline {
         int[] runs = t.runs();
         Map<Integer, Integer> laneOf = new LinkedHashMap<>();
         Map<Integer, String> name = new HashMap<>();
+        Map<Integer, String> firstName = new HashMap<>();
         for (int run : runs) {
             laneOf.putIfAbsent(t.thread(run), laneOf.size());
+            firstName.putIfAbsent(t.thread(run), t.label(run));
             name.put(t.thread(run), t.label(run));
         }
+        /* the boot CPU's thread runs main(), then becomes the scheduler */
+        for (var e : firstName.entrySet())
+            if ("boot".equals(e.getValue()) && !"boot".equals(name.get(e.getKey())))
+                name.put(e.getKey(), "boot (main), then " + name.get(e.getKey()));
         long[][] ran = new long[laneOf.size()][buckets];
         double[][] user = new double[laneOf.size()][buckets];
 
@@ -105,7 +133,128 @@ public final class Timeline {
                 marks.put(key, new Marker(b, m.step(), kind, m.label(), m.count() + 1, ln));
             }
         }
-        return new View(from, to, buckets, lanes, new ArrayList<>(marks.values()));
+        /* page-table switches (mov to cr3), counted per bucket and lane */
+        int[] sw = r.cr3Switches();
+        Map<Long, Marker> cr3 = new LinkedHashMap<>();
+        for (int k = lowerBound(sw, x -> x < first); k < sw.length && sw[k] < to; k++) {
+            int b = bucketOf(sw[k], from, span, buckets);
+            int root = t.rootAt(sw[k]);
+            Integer lane = root < 0 ? null : laneOf.get(t.thread(root));
+            int ln = lane == null ? -1 : lane;
+            long key = ((long) b << 20) | (ln & 0xffff);
+            Marker m = cr3.get(key);
+            cr3.put(key, m == null ? new Marker(b, sw[k], "cr3", "page table switch (mov to cr3)", 1, ln)
+                    : new Marker(b, m.step(), "cr3", m.label(), m.count() + 1, ln));
+        }
+        List<Marker> markers = new ArrayList<>(marks.values());
+        markers.addAll(cr3.values());
+        List<Milestone> ms = new ArrayList<>();
+        for (Milestone m : r.milestones())
+            if (m.step() >= from && m.step() < to)
+                ms.add(m);
+        List<Span> spans = new ArrayList<>();
+        List<Wake> wakes = new ArrayList<>();
+        states(r, laneOf, from, to, spans, wakes);
+        return new View(from, to, buckets, lanes, markers, ms, spans, wakes);
+    }
+
+    /**
+     * Each process lane's stretches between its runs, cut where its
+     * slot's state changed, and the wakeups (SLEEPING -> RUNNABLE) into
+     * it. A slot used by two processes in turn belongs to the earlier one
+     * until it is freed (UNUSED), to the later one after.
+     */
+    private static void states(Recording r, Map<Integer, Integer> laneOf, int from, int to,
+                               List<Span> spans, List<Wake> wakes) {
+        Tree t = r.tree();
+        ProcStates ps = r.procStates();
+        Map<Long, String> names = r.kernel().structs().enumWith("SLEEPING");
+        if (names == null || ps.slots() == 0)
+            return;
+        int steps = r.steps();
+        /* each thread's runs, in order */
+        Map<Integer, List<int[]>> runsOf = new LinkedHashMap<>();
+        for (int run : t.runs())
+            runsOf.computeIfAbsent(t.thread(run), k -> new ArrayList<>()).add(new int[] {t.start(run), t.end(run)});
+        /* the threads of each slot, in order of first run */
+        Map<Integer, List<Integer>> bySlot = new HashMap<>();
+        for (int th : runsOf.keySet()) {
+            int slot = t.threadSlot(th);
+            if (slot >= 0 && slot < ps.slots())
+                bySlot.computeIfAbsent(slot, k -> new ArrayList<>()).add(th);
+        }
+        for (var e : bySlot.entrySet()) {
+            int slot = e.getKey();
+            List<Integer> ths = e.getValue();
+            for (int j = 0; j < ths.size(); j++) {
+                int th = ths.get(j);
+                List<int[]> rs = runsOf.get(th);
+                int lo = j == 0 ? 0 : freedAfter(ps, names, slot, runsOf.get(ths.get(j - 1)).getLast()[1], rs.getFirst()[0]);
+                int hi = j + 1 == ths.size() ? steps
+                        : freedAfter(ps, names, slot, rs.getLast()[1], runsOf.get(ths.get(j + 1)).getFirst()[0]);
+                Integer lane = laneOf.get(th);
+                if (lane == null)
+                    continue;
+                /* the stretches it did not run: before, between and after its runs */
+                int at = lo;
+                for (int k = 0; k <= rs.size(); k++) {
+                    int gapEnd = k < rs.size() ? rs.get(k)[0] : hi;
+                    gap(ps, names, slot, lane, Math.max(at, from), Math.min(gapEnd, to), spans);
+                    if (k < rs.size())
+                        at = rs.get(k)[1];
+                }
+            }
+        }
+        /* wakeups: the thread whose store made a sleeping slot RUNNABLE */
+        for (int i = ps.firstAt(from); i < ps.size() && ps.step(i) < to && wakes.size() < MAX_SPANS; i++) {
+            if (!"RUNNABLE".equals(names.get((long) ps.value(i))))
+                continue;
+            int s = ps.step(i), slot = ps.slot(i);
+            if (!"SLEEPING".equals(names.get((long) ps.at(slot, s))))
+                continue;
+            int root = t.rootAt(s);
+            Integer by = root < 0 ? null : laneOf.get(t.thread(root));
+            Integer lane = null;
+            List<Integer> ths = bySlot.get(slot);
+            for (int k = 0; ths != null && k < ths.size(); k++)
+                if (runsOf.get(ths.get(k)).getFirst()[0] <= s || k == 0)
+                    lane = laneOf.get(ths.get(k));
+            if (by == null || lane == null)
+                continue;
+            wakes.add(new Wake(s, by, lane, r.threadLabel(s) + " woke proc[" + slot + "] (SLEEPING \u2192 RUNNABLE)"));
+        }
+    }
+
+    /** The first step in [a, b) at which slot became UNUSED (freed), else b. */
+    private static int freedAfter(ProcStates ps, Map<Long, String> names, int slot, int a, int b) {
+        for (int i = ps.firstAt(a); i < ps.size() && ps.step(i) < b; i++)
+            if (ps.slot(i) == slot && "UNUSED".equals(names.get((long) ps.value(i))))
+                return ps.step(i);
+        return b;
+    }
+
+    /** [a, b) of a lane that did not run, cut by its slot's state; only the states worth showing. */
+    private static void gap(ProcStates ps, Map<Long, String> names, int slot, int lane, int a, int b,
+                            List<Span> spans) {
+        if (a >= b || spans.size() >= MAX_SPANS)
+            return;
+        int start = a;
+        String state = names.get((long) ps.at(slot, a));
+        for (int i = ps.firstAt(a); i < ps.size() && ps.step(i) < b; i++) {
+            if (ps.slot(i) != slot)
+                continue;
+            /* a store is part of its step: the new state holds from the next one */
+            int s = ps.step(i) + 1;
+            add(spans, lane, start, s, state);
+            start = s;
+            state = names.get((long) ps.value(i));
+        }
+        add(spans, lane, start, b, state);
+    }
+
+    private static void add(List<Span> spans, int lane, int a, int b, String state) {
+        if (a < b && state != null && (state.equals("SLEEPING") || state.equals("RUNNABLE") || state.equals("ZOMBIE")))
+            spans.add(new Span(lane, a, b, state));
     }
 
     private static int bucketOf(int step, int from, long span, int buckets) {
@@ -114,14 +263,6 @@ public final class Timeline {
 
     /** Index of the first node of a list (sorted so that `before` holds for a prefix) where it does not hold. */
     private static int lowerBound(int[] nodes, IntPredicate before) {
-        int lo = 0, hi = nodes.length;
-        while (lo < hi) {
-            int mid = (lo + hi) >>> 1;
-            if (before.test(nodes[mid]))
-                lo = mid + 1;
-            else
-                hi = mid;
-        }
-        return lo;
+        return ProcStates.lowerBound(nodes.length, k -> before.test(nodes[k]));
     }
 }
